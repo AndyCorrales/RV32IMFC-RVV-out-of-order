@@ -7,7 +7,8 @@
 #include <array>
 #include <cstring>
 #include <iostream>
-
+#include "rv32c_defs.h"
+#include <vector>  
 #include "rv32i_defs.h"
 #include "immediates.h"
 #include "fp_ops.h"
@@ -22,7 +23,48 @@ SC_MODULE(Processor) {
     std::array<float, 32> fregs{}; // banco de registros f0-f31 (extension F, simple precision)
     uint32_t pc = 0;
     bool halted = false;
-    sc_event finished; // se notifica cuando el programa llega a instr==0
+    sc_event finished;
+// Contadores para IPC y CSRs rdcycle/rdinstret.
+// cycle_count: incrementa una vez por instruccion (modelo funcional
+//   monociclo — cada instruccion toma 1 ciclo).
+// instr_count: incrementa solo para instrucciones que llegan a commit
+//   (excluye halt por instruccion nula).
+    uint64_t cycle_count  = 0;
+    uint64_t instr_count  = 0;
+
+    // --- Caracterizacion: histograma de instrucciones por clase ---
+    enum InsnClass { IC_ALU, IC_ALUI, IC_LOAD, IC_STORE, IC_BRANCH, IC_JUMP,
+                     IC_MUL, IC_DIV, IC_FP, IC_SYSTEM, IC_OTHER, IC_COUNT };
+    uint64_t insn_hist[IC_COUNT] = {0};
+
+    void classify_instr(uint32_t opcode, uint32_t f3, uint32_t f7) {
+        switch (opcode) {
+            case 0x33: insn_hist[(f7 == 0x01) ? ((f3 < 4) ? IC_MUL : IC_DIV)
+                                              : IC_ALU]++; break;   // OP
+            case 0x13: insn_hist[IC_ALUI]++;   break;               // OP-IMM
+            case 0x37: case 0x17: insn_hist[IC_ALUI]++; break;      // LUI/AUIPC
+            case 0x03: insn_hist[IC_LOAD]++;   break;               // LOAD
+            case 0x23: insn_hist[IC_STORE]++;  break;               // STORE
+            case 0x07: insn_hist[IC_LOAD]++;   break;               // LOAD-FP
+            case 0x27: insn_hist[IC_STORE]++;  break;               // STORE-FP
+            case 0x63: insn_hist[IC_BRANCH]++; break;               // BRANCH
+            case 0x6F: case 0x67: insn_hist[IC_JUMP]++; break;      // JAL/JALR
+            case 0x53: case 0x43: case 0x47:
+            case 0x4B: case 0x4F: insn_hist[IC_FP]++; break;        // OP-FP/FMADD
+            case 0x73: insn_hist[IC_SYSTEM]++; break;               // SYSTEM
+            default:   insn_hist[IC_OTHER]++;  break;
+        }
+    }
+
+    void dump_hist() const {
+        const char* n[IC_COUNT] = {"ALU(reg)","ALU(imm)","LOAD","STORE",
+            "BRANCH","JUMP","MUL","DIV","FP","SYSTEM","OTHER"};
+        uint64_t tot = 0; for (int i = 0; i < IC_COUNT; i++) tot += insn_hist[i];
+        std::cerr << "\n[Histograma de instrucciones] total=" << tot << "\n";
+        for (int i = 0; i < IC_COUNT; i++)
+            std::cerr << "  " << n[i] << " : " << insn_hist[i]
+                      << " (" << (tot ? 100.0 * insn_hist[i] / tot : 0.0) << "%)\n";
+    }
 
     SC_CTOR(Processor) : init_socket("init_socket") {
         SC_THREAD(run);
@@ -76,7 +118,12 @@ SC_MODULE(Processor) {
     }
 
     void run() {
+        static const int RING = 16;
+        uint32_t ring_pc[RING] = {0};
+        uint32_t ring_in[RING] = {0};
+        int ring_i = 0;
         while (!halted) {
+            cycle_count++;          // un ciclo por iteracion del loop principal
             uint16_t half = fetch16(pc);
 
             // Halfword nulo (memoria sin programa): fin de ejecucion. Se
@@ -86,6 +133,18 @@ SC_MODULE(Processor) {
             // chequeo sigue significando exclusivamente "no hay mas
             // programa", nunca "instruccion comprimida no reconocida".
             if (half == 0) {
+                std::cerr << "\n[HALT-ZERO] el PC salto a memoria en ceros: PC=0x"
+                          << std::hex << pc << std::dec << "\n";
+                std::cerr << "Ultimas instrucciones ejecutadas (PC : instr):\n";
+                for (int k = 0; k < RING; k++) {
+                    int idx = (ring_i + k) % RING;
+                    if (ring_pc[idx] || ring_in[idx])
+                        std::cerr << "  0x" << std::hex << ring_pc[idx]
+                                  << " : 0x" << ring_in[idx] << std::dec << "\n";
+                }
+                std::cerr << "ra(x1)=0x" << std::hex << regs[1]
+                          << "  sp(x2)=0x" << regs[2]
+                          << "  gp(x3)=0x" << regs[3] << std::dec << "\n";
                 halted = true;
                 break;
             }
@@ -441,6 +500,92 @@ SC_MODULE(Processor) {
                     break;
                 }
 
+                case 0x73: { // SYSTEM: ECALL, EBREAK, CSRs (opcode no definido en rv32i_defs.h)
+                    uint32_t sys_f3   = (instr >> 12) & 0x7;
+                    uint32_t csr_addr = (instr >> 20) & 0xFFF;
+                    uint32_t sys_rd   = (instr >>  7) & 0x1F;
+
+                    if (sys_f3 == 0b000) {
+                        uint32_t funct12 = (instr >> 20) & 0xFFF;
+                        if (funct12 == 1) {
+                            // EBREAK
+                            std::cerr << "[EBREAK] en PC=0x" << std::hex << pc << std::dec << "\n";
+                            halted = true;
+                            break;
+                        }
+                        // ECALL — ABI Linux rv32, syscall en a7 (x17)
+                        uint32_t syscall_n = regs[17];
+                        switch (syscall_n) {
+                            case 64: {
+                                // SYS_WRITE(fd, buf, count)
+                                uint32_t fd    = regs[10];
+                                uint32_t baddr = regs[11];
+                                uint32_t count = regs[12];
+                                if (fd == 1 || fd == 2) {
+                                    std::vector<uint8_t> buf(count);
+                                    tlm::tlm_generic_payload t;
+                                    sc_time delay = SC_ZERO_TIME;
+                                    t.set_command(tlm::TLM_READ_COMMAND);
+                                    t.set_address(baddr);
+                                    t.set_data_ptr(buf.data());
+                                    t.set_data_length(count);
+                                    t.set_streaming_width(count);
+                                    t.set_byte_enable_ptr(nullptr);
+                                    t.set_dmi_allowed(false);
+                                    t.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+                                    init_socket->b_transport(t, delay);
+                                    if (t.get_response_status() == tlm::TLM_OK_RESPONSE) {
+                                        std::cout.write(reinterpret_cast<char*>(buf.data()), count);
+                                        std::cout.flush();
+                                        regs[10] = count;
+                                    } else {
+                                        regs[10] = static_cast<uint32_t>(-1);
+                                    }
+                                } else {
+                                    regs[10] = static_cast<uint32_t>(-1);
+                                }
+                                break;
+                            }
+                            case 93:
+                            case 94: {
+                                // SYS_EXIT / SYS_EXIT_GROUP
+                                uint32_t code = regs[10];
+                                std::cout << "\n[ECALL exit(" << code << ")]\n";
+                                std::cout << "──────────────────────────────────────────\n";
+                                std::cout << "  Ciclos       : " << cycle_count << "\n";
+                                std::cout << "  Instrucciones: " << instr_count << "\n";
+                                if (cycle_count > 0) {
+                                    uint64_t ipc_e = instr_count / cycle_count;
+                                    uint64_t ipc_f = (instr_count * 1000 / cycle_count) % 1000;
+                                    std::cout << "  IPC          : " << ipc_e << "." << ipc_f << "\n";
+                                    std::cout << "  Ref Ibex     : 0.680\n";
+                                }
+                                std::cout << "──────────────────────────────────────────\n";
+                                halted = true;
+                                sc_stop();
+                                break;
+                            }
+                            default:
+                                regs[10] = static_cast<uint32_t>(-1);
+                                break;
+                        }
+                    } else {
+                        // CSRs: rdcycle, rdinstret, rdtime
+                        uint32_t csr_val = 0;
+                        switch (csr_addr) {
+                            case 0xC00: csr_val = static_cast<uint32_t>(cycle_count);       break;
+                            case 0xC80: csr_val = static_cast<uint32_t>(cycle_count >> 32); break;
+                            case 0xC01: csr_val = static_cast<uint32_t>(cycle_count);       break;
+                            case 0xC81: csr_val = static_cast<uint32_t>(cycle_count >> 32); break;
+                            case 0xC02: csr_val = static_cast<uint32_t>(instr_count);       break;
+                            case 0xC82: csr_val = static_cast<uint32_t>(instr_count >> 32); break;
+                            default:    csr_val = 0; break;
+                        }
+                        if (sys_rd != 0) regs[sys_rd] = csr_val;
+                    }
+                    break;
+                } // case SYSTEM
+
                 default:
                     std::cerr << "[Processor] Opcode desconocido 0x" << std::hex << opcode
                               << " en PC=0x" << pc << std::dec << std::endl;
@@ -448,8 +593,12 @@ SC_MODULE(Processor) {
                     break;
             }
 
+            ring_pc[ring_i] = pc; ring_in[ring_i] = instr; ring_i = (ring_i + 1) % RING;
+            classify_instr(opcode, f3, f7);   // caracterizacion
+            instr_count++;    // instruccion completada correctamente
             pc = next_pc;
         }
+        dump_hist();
         finished.notify();
     }
 

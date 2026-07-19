@@ -4,6 +4,8 @@
 #include <iomanip>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <cstdint>
 
 #include "rv32i_defs.h"
 #include "memory_map.h"
@@ -534,24 +536,104 @@ SC_MODULE(Testbench) {
     }
 };
 
-int sc_main(int, char*[]) {
+// ─────────────────────────────────────────────────────────────────────────────
+// ELF Loader: carga un binario ELF32 en la RAM del simulador.
+// Parsea los segmentos PT_LOAD y los copia a memory.data[p_vaddr].
+// Devuelve el entry point (e_entry) para inicializar el PC del procesador.
+// ─────────────────────────────────────────────────────────────────────────────
+uint32_t load_elf_file(const char* path, Memory& mem) {
+    struct Ehdr {
+        uint8_t  e_ident[16];
+        uint16_t e_type, e_machine;
+        uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
+        uint16_t e_ehsize, e_phentsize, e_phnum;
+        uint16_t e_shentsize, e_shnum, e_shstrndx;
+    };
+    struct Phdr {
+        uint32_t p_type, p_offset, p_vaddr, p_paddr;
+        uint32_t p_filesz, p_memsz, p_flags, p_align;
+    };
+    constexpr uint32_t PT_LOAD = 1;
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "[ELF] No se pudo abrir: " << path << "\n";
+        std::exit(1);
+    }
+
+    Ehdr ehdr;
+    f.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+    if (!f || ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != 'E' ||
+        ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F') {
+        std::cerr << "[ELF] Magia invalida — no es un ELF valido\n";
+        std::exit(1);
+    }
+    if (ehdr.e_ident[4] != 1) {
+        std::cerr << "[ELF] Solo se soporta ELF32\n";
+        std::exit(1);
+    }
+
+    std::cout << "[ELF] Cargando: " << path << "\n";
+    std::cout << "[ELF] Entry point: 0x" << std::hex << ehdr.e_entry << std::dec << "\n";
+
+    for (uint16_t i = 0; i < ehdr.e_phnum; ++i) {
+        Phdr phdr;
+        f.seekg(ehdr.e_phoff + i * ehdr.e_phentsize);
+        f.read(reinterpret_cast<char*>(&phdr), sizeof(phdr));
+        if (phdr.p_type != PT_LOAD || phdr.p_filesz == 0) continue;
+
+        uint32_t ram_offset = phdr.p_vaddr - memory_map::RAM_BASE;
+        if (ram_offset + phdr.p_memsz > memory_map::RAM_SIZE) {
+            std::cerr << "[ELF] Segmento 0x" << std::hex << phdr.p_vaddr
+                      << " no cabe en RAM\n" << std::dec;
+            std::exit(1);
+        }
+
+        f.seekg(phdr.p_offset);
+        f.read(reinterpret_cast<char*>(mem.data.data() + ram_offset), phdr.p_filesz);
+
+        if (phdr.p_memsz > phdr.p_filesz)
+            std::memset(mem.data.data() + ram_offset + phdr.p_filesz,
+                        0, phdr.p_memsz - phdr.p_filesz);
+
+        std::cout << "[ELF]   PT_LOAD vaddr=0x" << std::hex << phdr.p_vaddr
+                  << " filesz=" << phdr.p_filesz
+                  << " memsz=" << phdr.p_memsz << std::dec << "\n";
+    }
+    return ehdr.e_entry;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sc_main: modo ELF si se pasa un argumento, modo test si no.
+//   ./riscv_sim coremark.elf   → carga binario y corre hasta ECALL exit
+//   ./riscv_sim                → corre el programa de prueba original
+// ─────────────────────────────────────────────────────────────────────────────
+int sc_main(int argc, char* argv[]) {
     Memory     memory("memory");
     Bus        bus("bus");
     Processor  cpu("cpu");
     VectorUnit vu("vector_unit");
-    Testbench  tb("testbench", cpu, vu, memory);
 
     cpu.init_socket.bind(bus.cpu_target);
     vu.init_socket.bind(bus.vector_target);
     bus.mem_initiator.bind(memory.socket);
 
-    // Carga del programa de prueba en RAM (acceso "backdoor" previo a
-    // sc_start(), habitual para inicializar memoria de programa en un
-    // testbench TLM-2.0; en ejecucion, todo acceso de la CPU pasa por Bus).
-    std::vector<uint8_t> program = build_test_program();
-    std::memcpy(memory.data.data(), program.data(), program.size());
-
-    sc_start();
+    if (argc >= 2) {
+        // Modo ELF: cargar binario compilado
+        uint32_t entry = load_elf_file(argv[1], memory);
+        cpu.pc      = entry;
+        cpu.regs[2] = memory_map::STACK_TOP;  // inicializar sp
+        std::cout << "[SIM] Modo ELF — sp=0x" << std::hex
+                  << memory_map::STACK_TOP << " pc=0x" << entry
+                  << std::dec << "\n\n";
+        sc_start();
+    } else {
+        // Modo test: programa de prueba original (sin cambios)
+        Testbench tb("testbench", cpu, vu, memory);
+        std::vector<uint8_t> program = build_test_program();
+        std::memcpy(memory.data.data(), program.data(), program.size());
+        sc_start();
+    }
 
     return 0;
 }
