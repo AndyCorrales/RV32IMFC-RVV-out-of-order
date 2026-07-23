@@ -31,9 +31,9 @@ verificada (RV32IMF completo); esto es una pista aparte, en paralelo.
   o intercalada en cualquier dirección par) no está cubierto acá. El
   modelo TLM sí soporta cualquier alineación de 2 bytes porque su fetch
   es un acceso de bus real de 16 bits, no un parámetro de entrada fijo.
-- ⬜ RVV **no** está en este prototipo todavía — el modelo TLM solo tiene
-  el esqueleto (`vector_load_test`), tampoco decodifica instrucciones
-  vectoriales reales.
+- 🚧 **RVV**: decoder mínimo pero real en `rv32_vector.cpp` (módulo
+  separado, no integrado al core escalar/OOO todavía) — ver sección
+  dedicada más abajo.
 - **Memoria de datos: maestro AXI4 Full** (`#pragma HLS INTERFACE m_axi`
   sobre el parámetro `mem`) — mismo protocolo que la RAM de Evaluación
   Corta 4, así ambas piezas del curso hablan el mismo lenguaje de
@@ -243,16 +243,183 @@ vitis_hls -f run_hls_ooo_core.tcl
 
 **Resultados de síntesis** (Vitis HLS 2024.2, `xck26-sfvc784-2LV-c`):
 
-| Métrica | RV32IM OOO (previo) | RV32IMFC OOO |
-|---|---|---|
-| Fmax estimado | 240.49 MHz | 135.86 MHz |
-| LUT | 9224 (7.8 %) | 15174 (12.9 %) |
-| FF | 3321 (1.4 %) | 4659 (2.0 %) |
-| DSP | 15 | 20 |
-| BRAM | 2 | 4 |
+| Métrica | RV32IM OOO (previo) | RV32IMFC OOO | RV32IMFC OOO + RVV |
+|---|---|---|---|
+| Fmax estimado | 240.49 MHz | 135.86 MHz | 135.86 MHz |
+| LUT | 9224 (7.8 %) | 15174 (12.9 %) | 16799 (14.3 %) |
+| FF | 3321 (1.4 %) | 4659 (2.0 %) | 5057 (2.2 %) |
+| DSP | 15 | 20 | 20 |
+| BRAM | 2 | 4 | 6 |
 
 La caída de Fmax al agregar F (240→136 MHz) viene del camino crítico de
 los operadores de punto flotante — es el mismo 135.86 MHz que estima el
-core escalar RV32IMFC, que paga el mismo camino. Dato útil para la
+core escalar RV32IMFC, que paga el mismo camino. Agregar la unidad
+vectorial (columna derecha) **no cambia el Fmax** — confirma que el
+camino crítico sigue siendo la FPU, no la unidad VEC. Dato útil para la
 sección de análisis del artículo: la extensión F domina el timing en
-ambas microarquitecturas, el costo del mecanismo OOO en sí es marginal.
+las tres configuraciones; el costo incremental de OOO y de RVV es
+marginal frente a eso.
+
+## Coprocesamiento vectorial integrado al core OOO
+
+`rv32_ooo.cpp` incorpora ahora una unidad vectorial (`VecRs`) como una
+reservation station más del mismo mecanismo OOO — no es un módulo
+aislado como `rv32_vector.cpp`, sino RVV real corriendo **junto** al
+resto del pipeline. Mismas 5 instrucciones y misma codificación de bits
+verificada contra la especificación oficial (`vle32.v`/`vse32.v` +
+`vadd.vv`/`vsub.vv`/`vmul.vv`), pero ahora despachadas desde el mismo
+decoder que el resto del programa.
+
+**Cómo se distingue de la extensión F escalar**: `vle32.v`/`vse32.v`
+comparten el opcode `LOAD-FP`/`STORE-FP` con `FLW`/`FSW` — la diferencia
+es el campo `width` (`010`=escalar F, `110`=vectorial de 32 bits), que
+el decoder chequea antes de rutear hacia la LSU o hacia la unidad VEC.
+
+**Simplificaciones** (ver `LIMITACIONES.md`): el banco vectorial no se
+renombra vía el ROB (sin VRAT) — una sola reservation station VEC
+serializa las instrucciones vectoriales *entre sí* (misma lógica que
+"memoria en orden"), pero pueden solaparse libremente con instrucciones
+escalares independientes. `vle32.v`/`vse32.v` se resuelven solo en la
+cabeza del ROB (más conservador que un store escalar, para no ampliar
+el ROB a 128 bits).
+
+**Evidencia de coprocesamiento real** (no solo "RVV existe" — RVV
+corriendo *junto* al resto del OOO): un `addi` despachado justo después
+de un `vadd.vv` (latencia 3 ciclos) completa en el ciclo 58, **antes**
+que el `vadd.vv` en el ciclo 59; lo mismo con `vmul.vv` (ciclo 62 vs
+63). El core escalar sigue avanzando mientras la unidad vectorial
+todavía está calculando — esa es la definición práctica de
+coprocesamiento con un motor fuera de orden, no dos programas separados
+que nunca se tocan.
+
+**Cómo correrlo**: mismo comando de arriba
+(`vitis_hls -f run_hls_ooo_core.tcl`) — el testbench ahora incluye la
+sección RVV en el mismo programa de prueba.
+
+## Bare-metal: correr un binario compilado real (items 1-5)
+
+El core OOO+RVV ejecuta un **binario ELF32 real compilado con
+`riscv64-unknown-elf-gcc`** (`-march=rv32imfc`), no solo programas
+ensamblados a mano. Cubre 5 de los 6 componentes de bare-metal (el 6º,
+traps precisas, se explica abajo):
+
+| # | Componente | Qué se agregó |
+|---|---|---|
+| 1 | Loader de ELF | Parser ELF32 en `rv32_ooo_baremetal_tb.cpp`: recorre los program headers y carga cada `PT_LOAD` a `imem` (ejecutable) o `dmem` |
+| 2 | Opcode `SYSTEM` | Reconocido en el decoder (antes caía en `default`) |
+| 3 | `ECALL`/`EBREAK` | Detienen el programa al retirarse del ROB — *excepción precisa gratis*: al llegar a la cabeza del ROB todo lo anterior ya committeó (retiro en orden), así que basta con no seguir committeando; no hace falta *squash* |
+| 4 | Instrucciones CSR | `CSRRW`/`CSRRS`/`CSRRC` + variantes con inmediato, en una unidad `SysRs` que ejecuta en la cabeza del ROB (acceso a CSR en orden de programa) |
+| 5 | Banco de CSRs | `mstatus`/`mtvec`/`mepc`/`mcause`/`mscratch`/`mie`/`mip`/`mtval` (almacenamiento) + `misa` (RV32IMFC) y `mhartid` (0) de solo lectura |
+| 6 | Traps precisas | ⬜ **Pendiente** — ver nota abajo |
+
+**El binario de prueba** (`baremetal/bm.c` + `crt0.s`, reproducible con
+`baremetal/build.sh`): hace un loop (suma 1..5 = 15, producto = 120),
+ejercita el banco de CSRs desde C (`csrw mscratch,0xABCD; csrr`), y
+escribe los tres resultados a memoria antes de su `ecall`. El testbench
+lo carga con el loader de ELF, lo corre hasta que el propio binario hace
+`ecall`, y verifica los resultados **sin backdoor** — todo salió de
+ejecutar las instrucciones reales del binario.
+
+**Cómo correrlo**:
+```bash
+cd RV32IMFC_hls
+vitis_hls -f run_hls_ooo_baremetal.tcl   # csim (corre el ELF real) + csynth
+```
+
+**Síntesis con bare-metal** (Vitis HLS 2024.2, `xck26-sfvc784-2LV-c`).
+Se corrió el flujo completo hasta **place & route real en Vivado**
+(`run_hls_ooo_impl.tcl`, `export_design -flow impl`), no solo el
+estimado de HLS — así hay números *post-implementación* para citar en
+"Resultados y Análisis":
+
+| Métrica | Estimado HLS (`csynth`) | **Post-P&R (Vivado)** |
+|---|---|---|
+| LUT | 17489 (14.9 %) | **7603 (6.5 %)** |
+| FF | 5473 (2.3 %) | **4829 (2.1 %)** |
+| DSP | 20 | **16** |
+| BRAM | 6 | **21** |
+| Periodo crítico | 7.36 ns (est.) | **7.43 ns (post-route)** |
+| Fmax | 135.86 MHz | **≈134.6 MHz** |
+| Timing @ 100 MHz | — | **cumple (slack positivo)** |
+
+Observaciones para el análisis: (1) el estimado de LUT de HLS es
+**~2.3× pesimista** frente a lo que realmente logra la síntesis+P&R de
+Vivado (7603 vs 17489) — HLS sobreestima sobre todo los multiplexores;
+(2) el BRAM sube post-implementación (21 vs 6) porque las memorias y la
+IP de punto flotante se mapean a bloques reales; (3) el Fmax
+post-route (≈134.6 MHz) confirma el estimado de HLS, con el camino
+crítico dominado por la FPU. El diseño **cierra timing** a los 100 MHz
+objetivo con holgura positiva. Reporte completo en
+`rv32_ooo_proj/solution1/impl/report/verilog/export_impl.rpt`.
+
+Agregar el banco de CSRs + la unidad de sistema (bare-metal) costó
+~700 LUT de estimado sobre la versión sin bare-metal, sin tocar el Fmax.
+
+**Por qué falta el item 6 (traps precisas)** — y por qué es
+específicamente difícil en un core OOO: un `ECALL`/interrupción a mitad
+de programa requiere descartar las instrucciones *posteriores* que ya
+están ejecutando fuera de orden (flush/*squash* del ROB) y saltar a
+`mtvec`. Ese mecanismo de *squash* es justo el que este diseño **evita a
+propósito** (por eso tampoco hay especulación de branches). Nuestro
+`ECALL`-como-halt funciona sin él porque es la última instrucción que
+importa (el `exit` del runtime nunca vuelve); pero un manejo de traps
+*reanudable* (volver al programa tras la excepción, vía `MRET`) sí
+necesitaría construir el *squash*. Es trabajo de otra magnitud, no una
+unidad funcional más — documentado como el siguiente paso.
+
+## Decoder RVV mínimo (`rv32_vector.cpp`)
+
+Primer decoder **real** de instrucciones del RISC-V "V" Vector Extension
+(RVV v1.0) — módulo nuevo y separado, no integrado todavía al core
+escalar ni al OOO. La codificación de bits de cada instrucción se
+verificó contra la especificación oficial (sección 7 "Vector Loads and
+Stores" y sección 19 "Vector Instruction Listing" del documento RVV
+v1.0), no se inventó de memoria.
+
+**Alcance, dividido en las dos secciones naturales del ISA vectorial**:
+
+- **Sección 1 — Memoria vectorial** (unit-stride, sin máscara):
+  `vle32.v vd,(rs1)` y `vse32.v vs3,(rs1)` — mueven 4 palabras de 32
+  bits entre memoria y un registro vectorial.
+- **Sección 2 — Aritmética vectorial vector-vector**: `vadd.vv`,
+  `vsub.vv` (grupo OPIVV), `vmul.vv` (grupo OPMVV) — operan elemento a
+  elemento sobre los 4 lanes de dos registros vectoriales.
+
+**Simplificaciones deliberadas** (ver `LIMITACIONES.md`): `SEW=32` y
+`LMUL=1` son la única configuración aceptada (`VLEN=128` → VLMAX=4
+elementos); cualquier otra activa `vill`. Sin máscara (`vm=1` siempre, `v0` no se usa
+como registro de máscara), sin loads/stores segmentados ni
+strided/indexed, sin reducción/permutación, sin punto flotante
+vectorial. El operando escalar `rs1` (dirección base) entra ya resuelto
+como parámetro — en una integración real, el core escalar leería
+`x[rs1]` y se lo pasaría a esta unidad, igual que quedó documentado como
+pendiente en `vector_unit.h` de la pista TLM.
+
+**Verificación**: el testbench (`rv32_vector_tb.cpp`) codifica las 6
+instrucciones a mano (mismos campos de bits que un ensamblador real
+generaría) y corre `vle32.v`×2 → `vadd.vv`/`vsub.vv`/`vmul.vv` →
+`vse32.v`, verificando los 4 lanes de cada uno de los 5 registros
+vectoriales resultantes más el *round-trip* a memoria del store — sin
+acceso *backdoor* al DUT.
+
+**Cómo correrlo**:
+```bash
+cd RV32IMFC_hls
+vitis_hls -f run_hls_vector.tcl
+```
+
+**Resultados de síntesis** (Vitis HLS 2024.2, `xck26-sfvc784-2LV-c`):
+
+| Métrica | Valor |
+|---|---|
+| Fmax estimado | 136.99 MHz |
+| LUT | 1998 (1.7 %) |
+| FF | 1232 (0.5 %) |
+| DSP | 3 |
+| BRAM | 4 |
+
+**Trabajo futuro**: integrar este decoder con el core escalar/OOO (que
+el CPU reconozca el opcode `OP-V`/`LOAD-FP`/`STORE-FP` vectorial y le
+pase `x[rs1]`), `vtype`/`vsetvli` real (SEW/LMUL variables), soporte de
+máscara, y el resto de las categorías del ISA (reducción, permutación,
+punto flotante vectorial, strided/indexed).

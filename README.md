@@ -35,10 +35,26 @@ relativas cruzadas):
   C.JR/C.MV/C.JALR/C.ADD. El fetch ahora es de 16 bits (no 32), con
   `pc` avanzando en 2 o 4 según corresponda. **RV32IMFC completo** en la
   versión TLM.
-- 🚧 **RVV**: `VectorUnit` conectada al Bus como initiator independiente,
-  con un banco de 32 registros vectoriales (VLEN=128 bits) y un test
-  end-to-end (CPU → Bus → Memory → VectorUnit). Todavía sin decoder de
-  instrucciones vectoriales reales.
+- ✅ **Ejecución fuera de orden (`ProcessorOOO`)**: Tomasulo-lite (RAT+FRAT
+  → ROB unificado de 8, 2×ALU, MUL/DIV, FPU con familia FMADD, LSU,
+  branch sin especulación, **y unidad vectorial RVV**), como `SC_MODULE`
+  alternativo que corre sobre la misma topología TLM (`Bus`/`Memory`).
+  Verificado con el mismo programa RV32IMFC+RVV que la pista HLS,
+  evidencia de reordenamiento y de coprocesamiento incluida (ver sección
+  abajo). No reemplaza a `Processor` (in-order) — son dos módulos
+  separados, mismo socket TLM.
+- ✅ **Coprocesamiento vectorial RVV (integrado al OOO)**: la unidad
+  `VecRs` de `ProcessorOOO` decodifica y ejecuta 5 instrucciones RVV
+  reales (`vle32.v`/`vse32.v` + `vadd.vv`/`vsub.vv`/`vmul.vv`,
+  codificación verificada contra la especificación oficial RVV v1.0)
+  como una reservation station más del pipeline OOO — no es un módulo
+  separado. Misma pieza en la pista HLS (`rv32_ooo.cpp`), mismos ciclos.
+- 🚧 **`VectorUnit`** (esqueleto standalone, previo a la integración):
+  initiator independiente conectado al Bus, banco de 32 registros
+  vectoriales y test end-to-end — reemplazado en el pipeline por la
+  unidad `VecRs` de arriba, se conserva por compatibilidad del testbench
+  in-order. `vtype`/`vsetvli`, máscara y el resto del ISA vectorial
+  siguen pendientes.
 - ⬜ CSRs, ECALL/EBREAK, loader de ELF, periféricos — no empezado (ver
   `explain.md` para el detalle de qué falta para correr binarios
   bare-metal reales).
@@ -102,6 +118,48 @@ Esto corre el programa de prueba embebido en `main.cpp` (ejercita las
 tres extensiones) e imprime el volcado de registros enteros y de punto
 flotante, más el resultado del test end-to-end de la VectorUnit.
 
+### Core RV32IMFC fuera de orden (`ProcessorOOO`)
+
+Además del modelo in-order de arriba, `RV32IMFC_tlm/src/processor_ooo.h`
+implementa el **mismo mecanismo Tomasulo-lite** (RAT+FRAT → ROB unificado
+de 8 entradas, 2×ALU, MUL/DIV, FPU con familia FMADD, LSU, branch sin
+especulación, **y unidad vectorial RVV**) que la pista HLS
+(`RV32IMFC_hls/rv32_ooo.cpp`), pero como `SC_MODULE` initiator TLM-2.0
+puro — mismo socket, mismo `bus_access` de 9 pasos, mismo fetch de 16
+bits por el Bus. Corre el **mismo programa** (I+M+F+C+RVV) que verifica
+la pista HLS, con los mismos resultados esperados y los mismos números de
+ciclo — correr ambos y obtener el mismo estado arquitectónico es la
+verificación cruzada TLM↔HLS.
+
+```bash
+g++ -std=c++17 -o riscv_ooo_sim RV32IMFC_tlm/src/main_ooo.cpp -lsystemc -lpthread
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu ./riscv_ooo_sim
+```
+
+Imprime la traza de dispatch/completion/commit ciclo a ciclo y termina
+con "Todos los checks pasaron." — incluida la evidencia de
+reordenamiento: una instrucción despachada después de un `mul`/`div`
+largo completa su ejecución antes (verificado también cruzando bancos
+entero↔flotante, con un `addi` completando antes que un `fdiv`), **y de
+coprocesamiento vectorial**: un `addi` escalar completa mientras un
+`vadd.vv`/`vmul.vv` todavía está ejecutando en la unidad vectorial (el
+core escalar avanza en paralelo, no bloqueado por RVV).
+
+**Coprocesamiento vectorial (RVV)**: la unidad `VecRs` incorpora las 5
+instrucciones RVV (`vle32.v`/`vse32.v` + `vadd.vv`/`vsub.vv`/`vmul.vv`,
+codificación verificada contra la especificación oficial RVV v1.0) como
+una reservation station más del mismo pipeline OOO — no un módulo
+aparte. `vle32.v`/`vse32.v` se distinguen de `FLW`/`FSW` escalar por el
+campo `width` y acceden a memoria por el Bus real (respetando TLM). El
+banco vectorial (`vregs`) es un miembro público, verificado directo por
+el testbench igual que `regs`/`fregs`.
+
+**Nota de diseño importante**: a diferencia de la pista HLS (que tiene
+`imem`/`dmem` físicamente separados), acá instrucciones y datos
+comparten la misma RAM — las direcciones de scratch del programa de
+prueba se eligieron deliberadamente lejos del código para no
+auto-modificarlo en ejecución (ver comentario en `main_ooo.cpp`).
+
 ## Estructura del código
 
 ```
@@ -115,7 +173,9 @@ RV32IMFC_tlm/src/
 ├── bus.h           # Bus TLM-2.0 (target + initiator, decodifica direcciones)
 ├── processor.h      # CPU: fetch de 16 bits + decoder + registros enteros/flotantes
 ├── vector_unit.h   # Esqueleto RVV (initiator independiente)
-└── main.cpp        # Ensamblador de prueba + integracion + testbench
+├── processor_ooo.h # CPU RV32IMFC fuera de orden (Tomasulo-lite), initiator TLM alternativo
+├── main.cpp        # Ensamblador de prueba + integracion + testbench (Processor in-order)
+└── main_ooo.cpp    # Testbench de ProcessorOOO (mismo programa que RV32IMFC_hls/rv32_ooo_tb.cpp)
 
 RV32IMFC_hls/
 ├── rv32i_defs.h         # Copia de RV32IMFC_tlm/src/rv32i_defs.h (autocontenido)
@@ -137,6 +197,10 @@ RV32IMFC_hls/
 - **`explain.md`**: explicación línea por línea de cada archivo, con
   ejemplos numéricos y trazas end-to-end — el lugar para entender *cómo*
   funciona el código, no solo *qué* hace.
+- **[`LIMITACIONES.md`](LIMITACIONES.md)**: limitaciones de alcance de
+  ambas pistas (HLS/TLM) y de sus cores in-order/fuera de orden, con
+  justificación técnica de cada una y qué haría falta para levantarlas
+  — la referencia directa para la sección de limitaciones del artículo.
 
 ## Contexto
 

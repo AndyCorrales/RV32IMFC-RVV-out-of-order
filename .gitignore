@@ -18,3 +18,16 @@ third_party/
 RV32IMFC_hls/rv32_ooo_tb
 RV32IMFC_hls/ooo_demo_tb
 RV32IMFC_hls/rv32_core_tb
+
+# Artefactos de compilacion del binario bare-metal (se regeneran con build.sh)
+RV32IMFC_hls/baremetal/*.o
+RV32IMFC_hls/baremetal/*.elf
+
+# Artefactos de las lineas de trabajo hacia Zve32x
+RV32IMFC+RVV+OOO-HLS/*_proj/
+RV32IMFC+RVV+OOO-HLS/*.log
+RV32IMFC+RVV+OOO-HLS/baremetal/*.o
+RV32IMFC+RVV+OOO-HLS/baremetal/*.elf
+RV32IMFC+RVV+OOO-TLM/riscv_ooo_sim
+RV32IMFC+RVV+OOO-HLS/baremetal/*.o
+RV32IMFC+RVV+OOO-HLS/baremetal/*.elf

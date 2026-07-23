@@ -25,7 +25,44 @@ constexpr uint32_t FMSUB     = 0b1000111; // R4-type: rd = (rs1*rs2)-rs3
 constexpr uint32_t FNMSUB    = 0b1001011; // R4-type: rd = -(rs1*rs2)+rs3
 constexpr uint32_t FNMADD    = 0b1001111; // R4-type: rd = -(rs1*rs2)-rs3
 constexpr uint32_t OP_FP     = 0b1010011; // R-type FP: aritmetica/comparacion/conversion
+
+// SYSTEM: ECALL/EBREAK (funct3=0) e instrucciones CSR (funct3=1..7) --
+// el minimo de sistema para bare-metal (ver rv32_ooo.cpp).
+constexpr uint32_t SYSTEM    = 0b1110011;
+constexpr uint32_t MISC_MEM  = 0b0001111; // FENCE / FENCE.I (no-op en este core)
 } // namespace Opcode
+
+// funct3 dentro de SYSTEM: 000 = ECALL/EBREAK (distinguidos por el
+// inmediato de 12 bits [31:20]); el resto son las 6 formas de acceso a
+// CSR (con registro o con inmediato de 5 bits, y write/set/clear).
+namespace Funct3_SYSTEM {
+constexpr uint32_t PRIV   = 0b000; // ECALL (imm=0) / EBREAK (imm=1) / MRET (imm=0x302)
+constexpr uint32_t CSRRW  = 0b001;
+constexpr uint32_t CSRRS  = 0b010;
+constexpr uint32_t CSRRC  = 0b011;
+constexpr uint32_t CSRRWI = 0b101;
+constexpr uint32_t CSRRSI = 0b110;
+constexpr uint32_t CSRRCI = 0b111;
+} // namespace Funct3_SYSTEM
+
+// Direcciones de CSR de modo maquina (subset minimo para bare-metal).
+namespace CSR {
+constexpr uint32_t MSTATUS = 0x300;
+constexpr uint32_t MISA    = 0x301;
+constexpr uint32_t MIE     = 0x304;
+constexpr uint32_t MTVEC   = 0x305;
+constexpr uint32_t MSCRATCH= 0x340;
+constexpr uint32_t MEPC    = 0x341;
+constexpr uint32_t MCAUSE  = 0x342;
+constexpr uint32_t MTVAL   = 0x343;
+constexpr uint32_t MIP     = 0x344;
+constexpr uint32_t MHARTID = 0xF14;
+// CSRs vectoriales (RVV): de solo lectura desde csrr -- los escribe la
+// familia vsetvli/vsetivli/vsetvl, no csrw.
+constexpr uint32_t VL      = 0xC20;
+constexpr uint32_t VTYPE   = 0xC21;
+constexpr uint32_t VLENB   = 0xC22;
+} // namespace CSR
 
 // funct3 para OP y OP_IMM (comparten codificacion base: la ALU hace lo
 // mismo ya sea con dos registros o con un registro+inmediato).
