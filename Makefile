@@ -16,8 +16,10 @@
 #  El flujo oficial de sintesis sigue siendo run_hls_ooo_core.tcl.
 # ==============================================================
 
-TLM  := RV32IMFC_tlm
-HLS  := RV32IMFC_hls
+TLM    := RV32IMFC_tlm
+HLS    := RV32IMFC_hls
+RVVHLS := RV32IMFC+RVV+OOO-HLS
+RVVTLM := RV32IMFC+RVV+OOO-TLM
 
 # --- Toolchains ---
 CC   := riscv64-unknown-elf-gcc
@@ -51,6 +53,7 @@ HLS_STD  := -std=c++14 -O2
 .PHONY: all sim clean check check-coremark check-hls check-ooo \
         coremark coremark-fast coremark-valid coremark-noc run-coremark \
         axpy gemm run-axpy run-gemm ooo-tb demo-tb core-tb \
+        rvv-ooo-tb run-rvv-ooo check-rvv-ooo sim-rvv run-rvv-tlm check-rvv-tlm \
         run-ooo run-demo run-core
 
 all: sim coremark ooo-tb
@@ -158,12 +161,44 @@ check-hls: ooo-tb demo-tb core-tb
 	    { tail -20 /tmp/demo_tb.log ; echo "FAIL: demo OoO." ; exit 1 ; }
 	@$(MAKE) --no-print-directory check-ooo
 
+# ===== OoO + RVV: pista HLS (C-sim con g++, sin Vitis) =====
+rvv-ooo-tb: $(AP_TYPES)
+	$(CXX) $(HLS_STD) $(AP_INC) -o $(RVVHLS)/rvv_ooo_tb \
+	    $(RVVHLS)/rv32_ooo.cpp $(RVVHLS)/rv32_ooo_tb.cpp
+
+run-rvv-ooo: rvv-ooo-tb
+	$(RVVHLS)/rvv_ooo_tb
+
+check-rvv-ooo: rvv-ooo-tb
+	@echo "=== [HLS] OoO+RVV (ISA+RVV fases 1-4 + suites ELF/UART/newlib) ==="
+	@$(RVVHLS)/rvv_ooo_tb > /tmp/rvv_ooo.log 2>&1 && \
+	    { grep -c "^OK" /tmp/rvv_ooo.log | xargs -I{} echo "{} checks OK" ; \
+	      echo "PASS: OoO+RVV HLS." ; } || \
+	    { tail -25 /tmp/rvv_ooo.log ; echo "FAIL: OoO+RVV HLS." ; exit 1 ; }
+
+# ===== OoO + RVV: pista TLM (SystemC) =====
+sim-rvv: $(RVVTLM)/riscv_rvv_sim
+$(RVVTLM)/riscv_rvv_sim: $(RVVTLM)/src/main.cpp $(wildcard $(RVVTLM)/src/*.h)
+	$(CXX) -std=c++17 -O2 -o $(RVVTLM)/riscv_rvv_sim \
+	    $(RVVTLM)/src/main.cpp -lsystemc -lpthread
+
+run-rvv-tlm: sim-rvv
+	$(RVVTLM)/riscv_rvv_sim
+
+check-rvv-tlm: sim-rvv
+	@echo "=== [TLM] OoO+RVV (verificacion cruzada TLM<->HLS) ==="
+	@$(RVVTLM)/riscv_rvv_sim > /tmp/rvv_tlm.log 2>&1 && \
+	    { grep -c "^OK" /tmp/rvv_tlm.log | xargs -I{} echo "{} checks OK" ; \
+	      echo "PASS: OoO+RVV TLM." ; } || \
+	    { tail -25 /tmp/rvv_tlm.log ; echo "FAIL: OoO+RVV TLM." ; exit 1 ; }
+
 # =================== TODO junto ===========================
-check: check-coremark check-hls
+check: check-coremark check-hls check-rvv-ooo check-rvv-tlm
 	@echo ""
 	@echo "TODAS las pruebas de reproducibilidad pasaron (TLM + HLS)."
 
 clean:
 	rm -f $(SIM) $(TLM)/*.elf $(HLS)/rv32_ooo_tb $(HLS)/ooo_demo_tb \
-	      $(HLS)/rv32_core_tb /tmp/cm_check.log /tmp/ooo_tb.log \
-	      /tmp/demo_tb.log /tmp/core_tb.log
+	      $(HLS)/rv32_core_tb $(RVVHLS)/rvv_ooo_tb $(RVVTLM)/riscv_rvv_sim \
+	      /tmp/cm_check.log /tmp/ooo_tb.log /tmp/demo_tb.log /tmp/core_tb.log \
+	      /tmp/rvv_ooo.log /tmp/rvv_tlm.log
