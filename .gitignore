@@ -1,1 +1,19 @@
 context.md
+riscv_sim
+explain.md
+
+# Artefactos generados por Vitis HLS / Vivado (RV32IMFC_hls/) -- se
+# regeneran corriendo run_hls.tcl / run_hls_ooo.tcl / vivado/run_vivado.tcl,
+# no hace falta versionarlos.
+RV32IMFC_hls/rv32_core_proj/
+RV32IMFC_hls/ooo_demo_proj/
+RV32IMFC_hls/rv32_kria_proj/
+RV32IMFC_hls/*_proj/
+RV32IMFC_hls/*.log
+RV32IMFC_hls/vivado/reports/
+*.jou
+.Xil/
+
+# Artefactos de compilacion del binario bare-metal (se regeneran con build.sh)
+RV32IMFC_hls/baremetal/*.o
+RV32IMFC_hls/baremetal/*.elf
