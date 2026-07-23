@@ -81,8 +81,14 @@
 // vectorial se expone como puerto de salida `vregs_out` (no pasa por el
 // stream de commit, ver nota de alcance arriba).
 
-#define OOO_IMEM_WORDS 64
-#define OOO_DMEM_WORDS 64
+// Memoria de instrucciones y datos (en palabras de 32 bits). Se
+// dimensionaron para que quepan los programas de prueba completos
+// (I+M+F+C+RVV con EEW variable) y un binario bare-metal chico.
+// 16384 palabras = 64KB cada una. Dimensionadas para que quepa un
+// binario con la biblioteca C completa (el printf de newlib solo ya son
+// ~54KB de codigo).
+#define OOO_IMEM_WORDS 16384
+#define OOO_DMEM_WORDS 16384
 #define OOO_VEC_NUM_VREGS 32
 #define OOO_VEC_LANES 4
 #define OOO_VEC_REGFILE_LEN (OOO_VEC_NUM_VREGS * OOO_VEC_LANES)

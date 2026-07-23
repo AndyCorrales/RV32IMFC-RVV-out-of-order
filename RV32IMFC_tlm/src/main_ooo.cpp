@@ -36,6 +36,14 @@ static uint32_t enc_vec_mem(uint32_t opcode, uint32_t vd_or_vs3, uint32_t rs1) {
     // nf=000, mew=0, mop=00, vm=1, lumop/sumop=00000, width=110 (32b)
     return (1u << 25) | (rs1 << 15) | (0b110u << 12) | (vd_or_vs3 << 7) | opcode;
 }
+// vsetvli rd, rs1, vtypei -- instr[31]=0, zimm[10:0]=instr[30:20],
+// rs1=AVL, funct3=111 (OPCFG). Formato de la seccion 5 de la spec.
+static uint32_t enc_vsetvli(uint32_t rd, uint32_t rs1, uint32_t vtypei) {
+    return ((vtypei & 0x7FF) << 20) | (rs1 << 15) | (0b111u << 12) | (rd << 7) | 0b1010111u;
+}
+// vtype para SEW=32 (vsew=010 en bits[5:3]) y LMUL=1 (vlmul=000 en bits[2:0])
+static const uint32_t VTYPE_E32_M1 = (0b010u << 3) | 0b000u;
+
 static uint32_t enc_op_v(uint32_t funct6, uint32_t vs2, uint32_t vs1, uint32_t funct3, uint32_t vd) {
     return (funct6 << 26) | (1u << 25) | (vs2 << 20) | (vs1 << 15) | (funct3 << 12) | (vd << 7) | 0b1010111u;
 }
@@ -99,20 +107,30 @@ static std::vector<uint16_t> build_test_program() {
     push32(i_type(OP_IMM, 16, F3A::ADD_SUB, 0, 21));          // 110: addi x16,x0,21    d26 (straddle)
     push16(0x078D);                                           // 114: c.addi x15,3      d27 -> x15=12
 
-    // ---- parte RVV: coprocesamiento (pcs 116..152) ----
-    // registros escalares 13/14/17/18 (libres) para bases/independientes
-    push32(i_type(OP_IMM, 13, F3A::ADD_SUB, 0, VEC_SRC1));                 // 116: addi x13,x0,512  d28
-    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/1, /*rs1=*/13));     // 120: vle32.v v1,(x13) d29 -> {10,20,30,40}
-    push32(i_type(OP_IMM, 14, F3A::ADD_SUB, 0, VEC_SRC2));                 // 124: addi x14,x0,528  d30
-    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/2, /*rs1=*/14));     // 128: vle32.v v2,(x14) d31 -> {1,2,3,4}
-    push32(enc_op_v(0b000000, 2, 1, 0b000, /*vd=*/3));                    // 132: vadd.vv v3,v2,v1 d32 (lat 3) -> {11,22,33,44}
-    push32(i_type(OP_IMM, 25, F3A::ADD_SUB, 0, 99));                      // 136: addi x25,x0,99   d33 (OOO vs d32)
-    push32(enc_op_v(0b100101, 1, 1, 0b010, /*vd=*/4));                   // 140: vmul.vv v4,v1,v1 d34 (lat 3) -> {100,400,900,1600}
-    push32(i_type(OP_IMM, 26, F3A::ADD_SUB, 0, 77));                      // 144: addi x26,x0,77   d35 (OOO vs d34)
-    push32(i_type(OP_IMM, 17, F3A::ADD_SUB, 0, VEC_DST));                 // 148: addi x17,x0,544  d36
-    push32(enc_vec_mem(rv32i::Opcode::STORE_FP, /*vs3=*/3, /*rs1=*/17));   // 152: vse32.v v3,(x17) d37 -> mem[544..559]
+    // ---- parte RVV: coprocesamiento (pcs 116..168) ----
+    // Todo programa RVV real arranca con vsetvli: al reset vtype tiene
+    // vill y vl=0, asi que sin el las vectoriales no procesarian nada.
+    push32(enc_vsetvli(/*rd=*/19, /*rs1=*/0, VTYPE_E32_M1));               // 116: vsetvli x19,x0,e32,m1 d28 -> vl=VLMAX=4
+    push32(i_type(OP_IMM, 13, F3A::ADD_SUB, 0, VEC_SRC1));                 // 120: addi x13,x0,512  d29
+    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/1, /*rs1=*/13));     // 124: vle32.v v1,(x13) d30 -> {10,20,30,40}
+    push32(i_type(OP_IMM, 14, F3A::ADD_SUB, 0, VEC_SRC2));                 // 128: addi x14,x0,528  d31
+    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/2, /*rs1=*/14));     // 132: vle32.v v2,(x14) d32 -> {1,2,3,4}
+    push32(enc_op_v(0b000000, 2, 1, 0b000, /*vd=*/3));                    // 136: vadd.vv v3,v2,v1 d33 (lat 3) -> {11,22,33,44}
+    push32(i_type(OP_IMM, 25, F3A::ADD_SUB, 0, 99));                      // 140: addi x25,x0,99   d34 (OOO vs d33)
+    push32(enc_op_v(0b100101, 1, 1, 0b010, /*vd=*/4));                   // 144: vmul.vv v4,v1,v1 d35 (lat 3) -> {100,400,900,1600}
+    push32(i_type(OP_IMM, 26, F3A::ADD_SUB, 0, 77));                      // 148: addi x26,x0,77   d36 (OOO vs d35)
+    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/5, /*rs1=*/13));     // 152: vle32.v v5,(x13) d37 -> centinela {10,20,30,40}
+    push32(i_type(OP_IMM, 17, F3A::ADD_SUB, 0, VEC_DST));                 // 156: addi x17,x0,544  d38
+    push32(enc_vec_mem(rv32i::Opcode::STORE_FP, /*vs3=*/3, /*rs1=*/17));   // 160: vse32.v v3,(x17) d39 -> mem[544..559]
 
-    push16(0x0000);                                           // 156: fin de programa
+    // ---- largo vectorial DINAMICO: vl=2 (AVL=2 < VLMAX=4) ----
+    // v5 quedara {11,22, 30,40}: los dos primeros calculados con vl=2, los
+    // dos ultimos sobrevivientes del centinela (tail-undisturbed).
+    push32(i_type(OP_IMM, 27, F3A::ADD_SUB, 0, 2));                       // 164: addi x27,x0,2    d40 (AVL=2)
+    push32(enc_vsetvli(/*rd=*/28, /*rs1=*/27, VTYPE_E32_M1));             // 168: vsetvli x28,x27  d41 -> vl=2
+    push32(enc_op_v(0b000000, 2, 1, 0b000, /*vd=*/5));                    // 172: vadd.vv v5,v2,v1 d42 -> solo lanes 0..1
+
+    push16(0x0000);                                           // 176: fin de programa
 
     return prog;
 }
@@ -164,6 +182,9 @@ SC_MODULE(TestbenchOOO) {
             {25, 99,         "addi independiente de vadd.vv"},
             {26, 77,         "addi independiente de vmul.vv"},
             {17, 544,        "addi (direccion del vse32.v)"},
+            {19, 4,          "vsetvli x19,x0 -> vl=VLMAX=4 (rs1=x0 pide el maximo)"},
+            {27, 2,          "addi (AVL para el segundo vsetvli)"},
+            {28, 2,          "vsetvli x28,x27 -> vl=min(AVL=2,VLMAX=4)=2 (largo dinamico)"},
         };
         for (const XC& c : xchecks) {
             if (cpu.regs[c.reg] != c.expect) {
@@ -199,8 +220,8 @@ SC_MODULE(TestbenchOOO) {
             {3, 2,   "d3 (addi) antes que d2 (mul)"},
             {12, 11, "d12 (sub) antes que d11 (div)"},
             {24, 23, "d24 (addi) antes que d23 (fdiv) -- OOO cruzando bancos"},
-            {33, 32, "d33 (addi) antes que d32 (vadd.vv) -- coprocesamiento: escalar avanza mientras VEC ejecuta"},
-            {35, 34, "d35 (addi) antes que d34 (vmul.vv) -- coprocesamiento"},
+            {34, 33, "d34 (addi) antes que d33 (vadd.vv) -- coprocesamiento: escalar avanza mientras VEC ejecuta"},
+            {36, 35, "d36 (addi) antes que d35 (vmul.vv) -- coprocesamiento"},
         };
         for (const OC& c : ooo) {
             int cl = cpu.complete_cycle[c.later], ce = cpu.complete_cycle[c.earlier];
@@ -220,6 +241,10 @@ SC_MODULE(TestbenchOOO) {
             {2,0,1}, {2,1,2}, {2,2,3}, {2,3,4},       // v2 (vle32.v)
             {3,0,11},{3,1,22},{3,2,33},{3,3,44},      // v3 (vadd.vv)
             {4,0,100},{4,1,400},{4,2,900},{4,3,1600}, // v4 (vmul.vv)
+            // v5: vadd.vv con vl=2 -- lanes 0..1 calculados, lanes 2..3
+            // conservan el centinela (tail undisturbed). Evidencia del
+            // largo vectorial dinamico.
+            {5,0,11},{5,1,22},{5,2,30},{5,3,40},
         };
         for (const VC& c : vchecks) {
             uint32_t got = cpu.vregs[c.vreg * ProcessorOOO::VEC_LANES + c.lane];
@@ -231,7 +256,7 @@ SC_MODULE(TestbenchOOO) {
             }
         }
 
-        const int N_EXPECTED = 38;
+        const int N_EXPECTED = 43;
         if (cpu.n_disp != N_EXPECTED) {
             std::printf("FAIL  dispatches: %d, esperados %d\n", cpu.n_disp, N_EXPECTED);
             ok = false;

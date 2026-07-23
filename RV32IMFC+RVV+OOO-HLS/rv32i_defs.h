@@ -27,7 +27,7 @@ constexpr uint32_t FNMADD    = 0b1001111; // R4-type: rd = -(rs1*rs2)-rs3
 constexpr uint32_t OP_FP     = 0b1010011; // R-type FP: aritmetica/comparacion/conversion
 
 // SYSTEM: ECALL/EBREAK (funct3=0) e instrucciones CSR (funct3=1..7) --
-// el minimo de sistema para bare-metal (ver processor_ooo.h).
+// el minimo de sistema para bare-metal (ver rv32_ooo.cpp).
 constexpr uint32_t SYSTEM    = 0b1110011;
 constexpr uint32_t MISC_MEM  = 0b0001111; // FENCE / FENCE.I (no-op en este core)
 } // namespace Opcode
@@ -59,9 +59,15 @@ constexpr uint32_t MIP     = 0x344;
 constexpr uint32_t MHARTID = 0xF14;
 // CSRs vectoriales (RVV): de solo lectura desde csrr -- los escribe la
 // familia vsetvli/vsetivli/vsetvl, no csrw.
+constexpr uint32_t VSTART  = 0x008; // read-write: primer elemento a ejecutar
 constexpr uint32_t VL      = 0xC20;
 constexpr uint32_t VTYPE   = 0xC21;
 constexpr uint32_t VLENB   = 0xC22;
+// mtime/mtimecmp: en hardware real son registros MMIO del CLINT, no CSRs.
+// Aca se exponen como CSRs de M-mode para no necesitar un periferico
+// aparte -- simplificacion documentada en el README.
+constexpr uint32_t MTIME    = 0x7C0;
+constexpr uint32_t MTIMECMP = 0x7C1;
 } // namespace CSR
 
 // funct3 para OP y OP_IMM (comparten codificacion base: la ALU hace lo

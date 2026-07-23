@@ -103,9 +103,22 @@ Documentadas también como comentario de cabecera en `rv32_ooo.h`.
   pero escribe en el commit): se aplicó la misma regla a ambos para no
   tener que ampliar el ROB a 128 bits (4 lanes) solo para los stores
   vectoriales.
-- **Mismas 5 instrucciones y mismas simplificaciones** que
-  `rv32_vector.cpp` (`SEW=32`/`LMUL=1`/`VLEN=128` fijos, sin
-  `vtype`/`vsetvli`, sin máscara) — ver el detalle completo abajo.
+- **`vsetvli`/`vsetivli`/`vsetvl` implementadas** con **`vl` dinámico**
+  (`vl = min(AVL, VLMAX)`), `vtype` real y política *tail-undisturbed*:
+  las vectoriales operan solo sobre los primeros `vl` elementos y dejan
+  el resto del registro sin tocar. Al reset `vtype.vill=1` y `vl=0`
+  (spec 3.11), así que un programa RVV real debe empezar con `vsetvli`
+  igual que en hardware de verdad. Se resuelve en el *dispatch* (como
+  `LUI`/`JAL`): es preciso porque el dispatch es en orden y este core no
+  especula, y evita serializar la unidad VEC. Si su AVL todavía está en
+  vuelo, el dispatch se detiene un ciclo.
+  **Lo que sigue faltando**: solo se acepta `SEW=32`/`LMUL=1` (cualquier
+  otra configuración activa `vill` y deja `vl=0`, que es el
+  comportamiento correcto) — sin anchos de elemento variables (8/16/64)
+  ni agrupación de registros (LMUL≠1).
+- **Solo 5 instrucciones de datos** (`vle32.v`/`vse32.v` +
+  `vadd.vv`/`vsub.vv`/`vmul.vv`), **sin máscara** (`vm=1` siempre) — ver
+  el detalle completo abajo.
 - **La distinción con `FLW`/`FSW` escalar es el campo `width`**
   (`010`=escalar, `110`=vectorial) — ambos opcodes (`LOAD-FP`/
   `STORE-FP`) se comparten con la extensión F, el decoder los separa
@@ -118,9 +131,9 @@ Documentadas también como comentario de cabecera en `rv32_ooo.h`.
   instrucciones vectoriales reales por su cuenta, pero el operando
   escalar `rs1` (dirección base) entra ya resuelto como parámetro — no
   hay ningún banco de registros enteros en este archivo.
-- **`SEW=32`/`LMUL=1`/`VLEN=128` fijos** (4 elementos por registro): sin
-  `vtype`/`vsetvli` dinámico — no se puede cambiar el ancho de elemento
-  ni agrupar registros en tiempo de ejecución.
+- **Sin `vsetvli`** (a diferencia del core OOO integrado, que sí lo
+  tiene): `SEW=32`/`LMUL=1`/`VLMAX=4` están fijos y no hay `vtype`/`vl`
+  — este módulo quedó como el prototipo previo a la integración.
 - **Sin máscara** (`vm=1` siempre) — `v0` no se usa como registro de
   máscara, ninguna instrucción predicada.
 - **Solo 5 instrucciones**: `vle32.v`/`vse32.v` (memoria unit-stride,
@@ -187,14 +200,16 @@ que ambas pistas sean comparables:
   programa de prueba dé el mismo resultado ciclo a ciclo en ambas
   pistas, como efectivamente se verificó — incluida la sección RVV).
 - Sin `frm`/`fflags`, sin D.
-- **RVV integrado** (unidad `VecRs`): mismas simplificaciones que la
-  pista HLS (banco vectorial sin renombrar, una sola RS que serializa
-  las instrucciones vectoriales entre sí, `vle32.v`/`vse32.v` resueltas
-  en la cabeza del ROB, `SEW=32`/`LMUL=1`/`VLEN=128` fijos, sin
-  `vtype`/`vsetvli` ni máscara, solo 5 instrucciones). A diferencia de
-  HLS, la memoria vectorial pasa por el Bus real (b_transport),
-  respetando la convención TLM. El esqueleto independiente `VectorUnit`
-  (ver abajo) sigue existiendo pero no se usa en este pipeline.
+- **RVV integrado** (unidad `VecRs`): exactamente las mismas
+  capacidades y simplificaciones que la pista HLS — banco vectorial sin
+  renombrar, una sola RS que serializa las vectoriales entre sí,
+  `vle32.v`/`vse32.v` resueltas en la cabeza del ROB, `vsetvli` con `vl`
+  dinámico y *tail-undisturbed*, única configuración soportada
+  `SEW=32`/`LMUL=1` (`VLEN=128`), sin máscara, 5 instrucciones de datos.
+  A diferencia de HLS, la memoria vectorial pasa por el Bus real
+  (`b_transport`), respetando la convención TLM. El esqueleto
+  independiente `VectorUnit` (ver abajo) sigue existiendo pero no se usa
+  en este pipeline.
 - Opcodes no soportados se retiran como *no-op*, sin traps reales.
 
 **Ventaja sobre la pista HLS** (vale la pena tenerlo presente, no es
@@ -231,10 +246,10 @@ desarrollo, documentado en el comentario de esa sección del archivo).
   verificado (unidad `VecRs`) — con los mismos números de ciclo en las
   dos pistas. Sigue faltando en los cores in-order (HLS `rv32_core.cpp`
   y TLM `Processor`), donde no aporta al objetivo (el tema pide OOO).
-  `vtype`/`vsetvli` real, máscara, y el resto de las categorías del ISA
-  (reducción, permutación, punto flotante vectorial) siguen siendo el
-  trabajo más grande pendiente hacia el objetivo final del equipo
-  (RV32IMFC + RVV out-of-order).
+  `vsetvli` con `vl` dinámico ya está en ambas pistas; lo que sigue
+  pendiente es SEW/LMUL variables, máscara, y el resto de las categorías
+  del ISA (reducción, permutación, punto flotante vectorial) hacia el
+  objetivo final del equipo (RV32IMFC + RVV out-of-order).
 - **Bare-metal** (correr binarios compilados reales, no solo programas
   ensamblados a mano):
   - **Hecho en el HLS OOO** (`rv32_ooo.cpp`, items 1-5): loader de ELF32

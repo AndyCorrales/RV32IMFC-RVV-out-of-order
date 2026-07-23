@@ -33,7 +33,9 @@
 // y misma codificacion de bits verificada contra la especificacion
 // oficial RVV v1.0 que la pista HLS (rv32_ooo.cpp) -- vle32.v/vse32.v
 // (memoria unit-stride) + vadd.vv/vsub.vv/vmul.vv (aritmetica
-// vector-vector), SEW=32/LMUL=1/VLEN=128 (4 lanes), sin vtype/vsetvli ni
+// vector-vector), MAS vsetvli/vsetivli/vsetvl con vl DINAMICO
+// (vl = min(AVL,VLMAX)) y tail-undisturbed. Unica configuracion
+// soportada: SEW=32/LMUL=1/VLEN=128 -> VLMAX=4 (otra activa vill). Sin
 // mascara. Se despachan desde el MISMO decoder OOO que el resto del
 // programa: un vadd.vv puede estar ejecutando mientras instrucciones
 // escalares independientes completan fuera de orden alrededor suyo --
@@ -90,11 +92,21 @@ SC_MODULE(ProcessorOOO) {
     static const uint32_t RVV_FUNCT6_VADD  = 0b000000;
     static const uint32_t RVV_FUNCT6_VSUB  = 0b000010;
     static const uint32_t RVV_FUNCT6_VMUL  = 0b100101;
+    static const uint32_t RVV_FUNCT3_OPCFG = 0b111; // vsetvli / vsetivli / vsetvl
+    // Campos de vtype (spec 3.4): vlmul[2:0], vsew[5:3], vta[6], vma[7],
+    // vill[XLEN-1]. Solo se soporta SEW=32 / LMUL=1 -> VLMAX = 128/32 = 4.
+    static const uint32_t RVV_VSEW_32  = 0b010;
+    static const uint32_t RVV_VLMUL_1  = 0b000;
+    static const uint32_t RVV_VILL_BIT = 31;
+    static const uint32_t RVV_VLMAX    = VEC_LANES;
 
     // ---- estado arquitectonico ----
     std::array<uint32_t, 32> regs{};
     std::array<float, 32> fregs{};
     std::array<uint32_t, VEC_REGFILE_LEN> vregs{}; // banco vectorial (sin renombrar)
+    // CSRs vectoriales: los escribe la familia vsetvl*, no csrw.
+    uint32_t csr_vtype = (1u << RVV_VILL_BIT); // al reset: vill activo
+    uint32_t csr_vl = 0;                       // ...y vl=0 (spec 3.11)
     bool halted = false;
     sc_event finished;
 
@@ -156,6 +168,7 @@ SC_MODULE(ProcessorOOO) {
         uint8_t arith_op;            // 0=vadd.vv, 1=vsub.vv, 2=vmul.vv
         uint8_t rob_tag;
         Operand s1;                  // direccion base (rs1, banco entero) -- solo memoria
+        uint8_t vl;                  // largo vectorial capturado en el dispatch
     };
 
     // ---- estado de la microarquitectura ----
@@ -241,8 +254,12 @@ SC_MODULE(ProcessorOOO) {
 
     // Aritmetica RVV vector-vector -- misma semantica que rv32_vector.cpp
     // (elemento a elemento sobre los VEC_LANES lanes).
+    // Limitada a los primeros `vl` elementos; el resto es el "tail" y se
+    // deja sin tocar (politica tail-undisturbed, que la spec permite usar
+    // siempre en implementaciones simples).
     void vec_arith_compute(const VecRs& u) {
         for (int lane = 0; lane < VEC_LANES; lane++) {
+            if (lane >= u.vl) continue;
             uint32_t a = vregs[u.vs2 * VEC_LANES + lane];
             uint32_t b = vregs[u.vs1 * VEC_LANES + lane];
             uint32_t r;
@@ -513,11 +530,13 @@ SC_MODULE(ProcessorOOO) {
         if (vec_rs.busy && (vec_rs.is_load || vec_rs.is_store) &&
             vec_rs.s1.ready && vec_rs.rob_tag == rob_head && rob[rob_head].valid) {
             uint32_t base = vec_rs.s1.val;
+            // solo los primeros `vl` elementos (tail sin tocar; el store
+            // tampoco escribe memoria mas alla de vl)
             if (vec_rs.is_load) {
-                for (int lane = 0; lane < VEC_LANES; lane++)
+                for (int lane = 0; lane < vec_rs.vl; lane++)
                     vregs[vec_rs.vd_or_vs3 * VEC_LANES + lane] = load(base + lane * 4, 4);
             } else {
-                for (int lane = 0; lane < VEC_LANES; lane++)
+                for (int lane = 0; lane < vec_rs.vl; lane++)
                     store(base + lane * 4, vregs[vec_rs.vd_or_vs3 * VEC_LANES + lane], 4);
             }
             rob[vec_rs.rob_tag].ready = true;
@@ -673,6 +692,7 @@ SC_MODULE(ProcessorOOO) {
                 vec_rs.is_arith = false;
                 vec_rs.vd_or_vs3 = rd; // mismo campo de bits que vd (load) o vs3 (store)
                 vec_rs.rob_tag = new_tag;
+                vec_rs.vl = csr_vl;             // largo vectorial vigente al despachar
                 vec_rs.s1 = read_operand(rs1i); // direccion base, banco entero
                 RobEntry& e = rob[new_tag];
                 e.valid = true; e.is_store = false; e.dest_is_fp = false;
@@ -769,6 +789,55 @@ SC_MODULE(ProcessorOOO) {
                 // sin especulacion: fetch detenido hasta resolver el destino
                 fetch_stalled = true;
             }
+        } else if (opc == RVV_OPCODE_OP_V && f3 == RVV_FUNCT3_OPCFG) {
+            // ---- vsetvli / vsetivli / vsetvl (seccion 5 de la spec) ----
+            // Se resuelve EN EL DISPATCH (como LUI/JAL): el dispatch es en
+            // orden y este core no especula, asi que actualizar vtype/vl
+            // aca es preciso y hace que toda vectorial posterior capture el
+            // vl nuevo sin serializar la unidad VEC. Requiere el AVL ya
+            // disponible: si el productor sigue en vuelo, se detiene el
+            // dispatch y se reintenta el ciclo siguiente.
+            bool is_vsetivli = (((instr >> 30) & 0x3) == 0x3);
+            bool is_vsetvl   = (((instr >> 25) & 0x7F) == 0b1000000);
+            Operand avl_op  = read_operand(rs1i);
+            Operand vtyp_op = read_operand(rs2i);
+            bool operands_ready = is_vsetivli
+                                ? true
+                                : (avl_op.ready && (!is_vsetvl || vtyp_op.ready));
+            if (operands_ready) {
+                can_dispatch = true;
+                uint32_t vtype_req, avl;
+                bool avl_is_max = false, keep_vl = false;
+                if (is_vsetivli) {
+                    vtype_req = (instr >> 20) & 0x3FF;  // zimm[9:0]
+                    avl = rs1i;                          // uimm[4:0]
+                } else if (is_vsetvl) {
+                    vtype_req = vtyp_op.val;
+                    if (rs1i == 0) { if (rd == 0) keep_vl = true; else avl_is_max = true; }
+                    avl = avl_op.val;
+                } else { // vsetvli
+                    vtype_req = (instr >> 20) & 0x7FF;  // zimm[10:0]
+                    if (rs1i == 0) { if (rd == 0) keep_vl = true; else avl_is_max = true; }
+                    avl = avl_op.val;
+                }
+                uint32_t vsew  = (vtype_req >> 3) & 0x7;
+                uint32_t vlmul = vtype_req & 0x7;
+                bool supported = (vsew == RVV_VSEW_32) && (vlmul == RVV_VLMUL_1);
+                uint32_t new_vl;
+                if (!supported) {                 // configuracion no soportada
+                    csr_vtype = (1u << RVV_VILL_BIT);
+                    new_vl = 0;
+                } else {
+                    csr_vtype = vtype_req;
+                    if (keep_vl)         new_vl = csr_vl;
+                    else if (avl_is_max) new_vl = RVV_VLMAX;
+                    else                 new_vl = (avl < RVV_VLMAX) ? avl : RVV_VLMAX;
+                }
+                csr_vl = new_vl;
+                RobEntry& e = rob[new_tag];
+                e.valid = true; e.is_store = false; e.dest_is_fp = false;
+                e.dest = rd; e.value = new_vl; e.ready = true;
+            }
         } else if (opc == RVV_OPCODE_OP_V) {
             // vadd.vv/vsub.vv/vmul.vv -- funct6/funct3 verificados contra
             // la seccion 19 de la especificacion oficial RVV v1.0.
@@ -784,6 +853,7 @@ SC_MODULE(ProcessorOOO) {
                     vec_rs.vd_or_vs3 = rd; vec_rs.vs1 = rs1i; vec_rs.vs2 = rs2i;
                     vec_rs.arith_op = is_add ? 0 : is_sub ? 1 : 2;
                     vec_rs.rob_tag = new_tag;
+                    vec_rs.vl = csr_vl;       // largo vectorial vigente al despachar
                     vec_rs.executing = false; // arranca en la etapa 3, como el resto
                     RobEntry& e = rob[new_tag];
                     e.valid = true; e.is_store = false; e.dest_is_fp = false;

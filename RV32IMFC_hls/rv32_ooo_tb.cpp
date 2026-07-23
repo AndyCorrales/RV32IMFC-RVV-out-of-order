@@ -39,6 +39,13 @@ static ap_uint<32> enc_op_v(uint32_t funct6, uint32_t vs2, uint32_t vs1, uint32_
     const uint32_t vm = 1;
     return (funct6 << 26) | (vm << 25) | (vs2 << 20) | (vs1 << 15) | (funct3 << 12) | (vd << 7) | 0b1010111u;
 }
+// vsetvli rd, rs1, vtypei -- instr[31]=0, zimm[10:0]=instr[30:20],
+// rs1=AVL, funct3=111 (OPCFG). Formato de la seccion 5 de la spec.
+static ap_uint<32> enc_vsetvli(uint32_t rd, uint32_t rs1, uint32_t vtypei) {
+    return ((vtypei & 0x7FF) << 20) | (rs1 << 15) | (0b111u << 12) | (rd << 7) | 0b1010111u;
+}
+// vtype para SEW=32 (vsew=010 en bits[5:3]) y LMUL=1 (vlmul=000 en bits[2:0])
+static const uint32_t VTYPE_E32_M1 = (0b010u << 3) | 0b000u;
 
 int main() {
     ap_uint<32> imem[OOO_IMEM_WORDS] = {0};
@@ -100,18 +107,32 @@ int main() {
     push32(i_type(OP_IMM, 16, F3A::ADD_SUB, 0, 21));       // 110: addi x16,x0,21    d26 (32 bits, pc%4==2: straddle)
     push16(0x078D);                                        // 114: c.addi x15,3      d27 -> x15=12
 
-    // ---- parte RVV: coprocesamiento (pcs 116..148) ----
-    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/1, /*rs1=*/0));    // 116: vle32.v v1,(x0)   d28 -> {10,20,30,40}
-    push32(i_type(OP_IMM, 13, F3A::ADD_SUB, 0, 16));                    // 120: addi x13,x0,16    d29
-    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/2, /*rs1=*/13));  // 124: vle32.v v2,(x13)  d30 -> {1,2,3,4}
-    push32(enc_op_v(rvv_funct6_add, 2, 1, rvv_f3_opivv, /*vd=*/3));     // 128: vadd.vv v3,v2,v1  d31 (lat 2) -> {11,22,33,44}
-    push32(i_type(OP_IMM, 14, F3A::ADD_SUB, 0, 99));                    // 132: addi x14,x0,99    d32 (OOO vs d31)
-    push32(enc_op_v(rvv_funct6_mul, 1, 1, rvv_f3_opmvv, /*vd=*/4));     // 136: vmul.vv v4,v1,v1  d33 (lat 2) -> {100,400,900,1600}
-    push32(i_type(OP_IMM, 17, F3A::ADD_SUB, 0, 77));                    // 140: addi x17,x0,77    d34 (OOO vs d33)
-    push32(i_type(OP_IMM, 18, F3A::ADD_SUB, 0, 32));                    // 144: addi x18,x0,32    d35
-    push32(enc_vec_mem(rv32i::Opcode::STORE_FP, /*vs3=*/3, /*rs1=*/18)); // 148: vse32.v v3,(x18) d36 -> dmem[32..47]
+    // ---- parte RVV: coprocesamiento (pcs 116..164) ----
+    // Todo programa RVV real arranca configurando el largo vectorial con
+    // vsetvli: al reset vtype tiene vill y vl=0, asi que SIN este vsetvli
+    // las vectoriales de abajo no procesarian ningun elemento.
+    push32(enc_vsetvli(/*rd=*/19, /*rs1=*/0, VTYPE_E32_M1));            // 116: vsetvli x19,x0,e32,m1 d28 -> vl=VLMAX=4
+    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/1, /*rs1=*/0));    // 120: vle32.v v1,(x0)   d29 -> {10,20,30,40}
+    push32(i_type(OP_IMM, 13, F3A::ADD_SUB, 0, 16));                    // 124: addi x13,x0,16    d30
+    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/2, /*rs1=*/13));  // 128: vle32.v v2,(x13)  d31 -> {1,2,3,4}
+    push32(enc_op_v(rvv_funct6_add, 2, 1, rvv_f3_opivv, /*vd=*/3));     // 132: vadd.vv v3,v2,v1  d32 (lat 2) -> {11,22,33,44}
+    push32(i_type(OP_IMM, 14, F3A::ADD_SUB, 0, 99));                    // 136: addi x14,x0,99    d33 (OOO vs d32)
+    push32(enc_op_v(rvv_funct6_mul, 1, 1, rvv_f3_opmvv, /*vd=*/4));     // 140: vmul.vv v4,v1,v1  d34 (lat 2) -> {100,400,900,1600}
+    push32(i_type(OP_IMM, 17, F3A::ADD_SUB, 0, 77));                    // 144: addi x17,x0,77    d35 (OOO vs d34)
+    push32(enc_vec_mem(rv32i::Opcode::LOAD_FP, /*vd=*/5, /*rs1=*/0));   // 148: vle32.v v5,(x0)   d36 -> centinela {10,20,30,40}
+    push32(i_type(OP_IMM, 18, F3A::ADD_SUB, 0, 32));                    // 152: addi x18,x0,32    d37
+    push32(enc_vec_mem(rv32i::Opcode::STORE_FP, /*vs3=*/3, /*rs1=*/18)); // 156: vse32.v v3,(x18) d38 -> dmem[32..47]
 
-    push16(0x0000);                                        // 152: fin de programa
+    // ---- largo vectorial DINAMICO: vl=2 (AVL=2 < VLMAX=4) ----
+    // Con vl=2, el vadd.vv solo debe tocar los 2 primeros elementos de v5
+    // y dejar los otros 2 SIN TOCAR (tail-undisturbed): v5 quedara
+    // {11,22, 30,40} -- los dos primeros calculados, los dos ultimos
+    // sobrevivientes del centinela cargado arriba con vl=4.
+    push32(i_type(OP_IMM, 26, F3A::ADD_SUB, 0, 2));                     // 160: addi x26,x0,2     d39 (AVL=2)
+    push32(enc_vsetvli(/*rd=*/27, /*rs1=*/26, VTYPE_E32_M1));           // 164: vsetvli x27,x26,e32,m1 d40 -> vl=2
+    push32(enc_op_v(rvv_funct6_add, 2, 1, rvv_f3_opivv, /*vd=*/5));     // 168: vadd.vv v5,v2,v1  d41 -> solo lanes 0..1
+
+    push16(0x0000);                                        // 172: fin de programa
 
     for (size_t i = 0; i < prog.size(); i++) {
         uint32_t w = imem[i / 2].to_uint();
@@ -224,6 +245,9 @@ int main() {
         {13, 16,         "addi (base del segundo vle32.v)"},
         {14, 99,         "addi independiente de vadd.vv"},
         {17, 77,         "addi independiente de vmul.vv"},
+        {19, 4,          "vsetvli x19,x0 -> vl=VLMAX=4 (rs1=x0 pide el maximo)"},
+        {26, 2,          "addi (AVL para el segundo vsetvli)"},
+        {27, 2,          "vsetvli x27,x26 -> vl=min(AVL=2,VLMAX=4)=2 (largo dinamico)"},
         {18, 32,         "addi (direccion del vse32.v)"},
     };
     for (auto& c : xchecks) {
@@ -257,8 +281,8 @@ int main() {
         {3, 2,   "d3 (addi) antes que d2 (mul)"},
         {12, 11, "d12 (sub) antes que d11 (div)"},
         {24, 23, "d24 (addi) antes que d23 (fdiv) -- OOO cruzando bancos"},
-        {32, 31, "d32 (addi) antes que d31 (vadd.vv) -- coprocesamiento: escalar avanza mientras VEC ejecuta"},
-        {34, 33, "d34 (addi) antes que d33 (vmul.vv) -- coprocesamiento"},
+        {33, 32, "d33 (addi) antes que d32 (vadd.vv) -- coprocesamiento: escalar avanza mientras VEC ejecuta"},
+        {35, 34, "d35 (addi) antes que d34 (vmul.vv) -- coprocesamiento"},
     };
     for (auto& c : ooo) {
         if (complete_cycle[c.later] > 0 && complete_cycle[c.earlier] > 0 &&
@@ -272,7 +296,7 @@ int main() {
         }
     }
 
-    const int N_EXPECTED = 37;
+    const int N_EXPECTED = 42;
     if (n_disp != N_EXPECTED) {
         printf("FAIL  dispatches: %d, esperados %d\n", n_disp, N_EXPECTED);
         ok = false;
@@ -302,6 +326,10 @@ int main() {
         {2,0,1}, {2,1,2}, {2,2,3}, {2,3,4},    // v2 (vle32.v)
         {3,0,11},{3,1,22},{3,2,33},{3,3,44},   // v3 (vadd.vv)
         {4,0,100},{4,1,400},{4,2,900},{4,3,1600}, // v4 (vmul.vv)
+        // v5: vadd.vv ejecutado con vl=2 -- lanes 0..1 calculados,
+        // lanes 2..3 conservan el centinela cargado con vl=4 (tail
+        // undisturbed). Esta es la evidencia del largo vectorial dinamico.
+        {5,0,11},{5,1,22},{5,2,30},{5,3,40},
     };
     for (auto& c : vchecks) {
         uint32_t got = vregs_out[c.vreg * OOO_VEC_LANES + c.lane].to_uint();

@@ -30,9 +30,18 @@ namespace rvv {
     constexpr uint32_t WIDTH_32    = 0b110; // distingue vle32.v/vse32.v de FLW/FSW (width=010)
     constexpr uint32_t FUNCT3_OPIVV = 0b000;
     constexpr uint32_t FUNCT3_OPMVV = 0b010;
+    constexpr uint32_t FUNCT3_OPCFG = 0b111; // vsetvli / vsetivli / vsetvl
     constexpr uint32_t FUNCT6_VADD  = 0b000000;
     constexpr uint32_t FUNCT6_VSUB  = 0b000010;
     constexpr uint32_t FUNCT6_VMUL  = 0b100101;
+
+    // Campos de vtype (seccion 3.4 de la spec): vlmul[2:0], vsew[5:3],
+    // vta[6], vma[7], vill[XLEN-1]. Este core solo soporta la
+    // configuracion SEW=32 / LMUL=1 -> VLMAX = VLEN/SEW = 128/32 = 4.
+    constexpr uint32_t VSEW_32   = 0b010; // vsew: 000=8,001=16,010=32,011=64
+    constexpr uint32_t VLMUL_1   = 0b000; // vlmul: 000=1, 001=2, ... 111=1/2
+    constexpr uint32_t VILL_BIT  = 31;    // XLEN-1 en RV32
+    constexpr uint32_t VLMAX     = OOO_VEC_LANES; // 4 elementos
 }
 
 // ================= estado persistente (registros en RTL) =================
@@ -140,6 +149,11 @@ struct VecRs {
     ap_uint<2>  arith_op;   // 0=vadd.vv, 1=vsub.vv, 2=vmul.vv
     ap_uint<3>  rob_tag;
     Operand     s1;         // direccion base (rs1, banco entero) -- solo memoria
+    // `vl` vigente CAPTURADO EN EL DISPATCH: como el dispatch es en orden
+    // de programa y este core no especula (toda instruccion despachada
+    // committea), capturar aca el largo vectorial es preciso y ademas
+    // permite que la unidad VEC siga solapandose con el core escalar.
+    ap_uint<3>  vl;
 };
 
 static ap_uint<32> regfile[32];
@@ -163,6 +177,9 @@ static ap_uint<32> vregs[OOO_VEC_REGFILE_LEN]; // banco vectorial, sin renombrar
 // a main. mhartid es read-only (0 = unico hart), misa reporta RV32IMFC.
 static ap_uint<32> csr_mstatus, csr_mie, csr_mtvec, csr_mscratch;
 static ap_uint<32> csr_mepc, csr_mcause, csr_mtval, csr_mip;
+// CSRs vectoriales (RVV): vtype y vl, escritos por vsetvli/vsetivli/vsetvl
+// y leibles con csrr (direcciones 0xC21/0xC20 de la spec).
+static ap_uint<32> csr_vtype, csr_vl;
 static bool        ecall_halt; // se activa al retirar un ECALL/EBREAK
 static ap_uint<32> fetch_pc;
 static bool        fetch_stalled; // esperando resolucion de BRANCH/JALR
@@ -235,6 +252,10 @@ static ap_uint<32> read_csr(ap_uint<12> addr) {
         case rv32i::CSR::MTVAL:    return csr_mtval;
         case rv32i::CSR::MIP:      return csr_mip;
         case rv32i::CSR::MHARTID:  return 0;
+        // CSRs vectoriales de solo lectura (los escribe vsetvl*, no csrw)
+        case rv32i::CSR::VL:       return csr_vl;
+        case rv32i::CSR::VTYPE:    return csr_vtype;
+        case rv32i::CSR::VLENB:    return OOO_VEC_LANES * 4; // VLEN/8 = 16 bytes
         default:                   return 0;
     }
 }
@@ -408,19 +429,24 @@ static ap_uint<32> fpu_compute(const FpuRs& u) {
     }
 }
 
-// Aritmetica RVV vector-vector -- misma semantica que rv32_vector.cpp
-// (elemento a elemento sobre los OOO_VEC_LANES lanes), factorizada aca
-// para que la unidad VEC la invoque desde etapa2 igual que las demas.
+// Aritmetica RVV vector-vector -- misma semantica que rv32_vector.cpp,
+// pero limitada a los primeros `vl` elementos (el largo vectorial
+// dinamico que fijo el ultimo vsetvli). Los elementos con indice >= vl
+// son el "tail" y se dejan SIN TOCAR (politica tail-undisturbed, vta=0):
+// la spec permite explicitamente que una implementacion simple ignore
+// vta y use siempre undisturbed (nota de la seccion 3.4.3).
 static void vec_arith_compute(const VecRs& u, ap_uint<32> vregs[OOO_VEC_REGFILE_LEN]) {
     for (int lane = 0; lane < OOO_VEC_LANES; lane++) {
 #pragma HLS UNROLL
-        ap_uint<32> a = vregs[u.vs2.to_uint() * OOO_VEC_LANES + lane];
-        ap_uint<32> b = vregs[u.vs1.to_uint() * OOO_VEC_LANES + lane];
-        ap_uint<32> r;
-        if (u.arith_op == 0)      r = a + b; // vadd.vv
-        else if (u.arith_op == 1) r = a - b; // vsub.vv
-        else                      r = a * b; // vmul.vv
-        vregs[u.vd_or_vs3.to_uint() * OOO_VEC_LANES + lane] = r;
+        if (lane < u.vl.to_uint()) {
+            ap_uint<32> a = vregs[u.vs2.to_uint() * OOO_VEC_LANES + lane];
+            ap_uint<32> b = vregs[u.vs1.to_uint() * OOO_VEC_LANES + lane];
+            ap_uint<32> r;
+            if (u.arith_op == 0)      r = a + b; // vadd.vv
+            else if (u.arith_op == 1) r = a - b; // vsub.vv
+            else                      r = a * b; // vmul.vv
+            vregs[u.vd_or_vs3.to_uint() * OOO_VEC_LANES + lane] = r;
+        }
     }
 }
 
@@ -571,6 +597,13 @@ void rv32_ooo_tick(
         sys_rs.busy = false;
         csr_mstatus = 0; csr_mie = 0; csr_mtvec = 0; csr_mscratch = 0;
         csr_mepc = 0; csr_mcause = 0; csr_mtval = 0; csr_mip = 0;
+        // Estado vectorial al reset (spec 3.11): vtype con vill activo y
+        // vl=0, es decir "no hay configuracion vectorial valida todavia".
+        // Consecuencia: una instruccion vectorial ANTES del primer
+        // vsetvli opera sobre 0 elementos (no hace nada), igual que
+        // manda la definicion de `body` con vl=0.
+        csr_vtype = (ap_uint<32>(1) << rvv::VILL_BIT);
+        csr_vl = 0;
         ecall_halt = false;
         for (int i = 0; i < OOO_VEC_REGFILE_LEN; i++) {
             vregs[i] = 0;
@@ -718,17 +751,23 @@ void rv32_ooo_tick(
     if (vec_rs.busy && (vec_rs.is_load || vec_rs.is_store) &&
         vec_rs.s1.ready && vec_rs.rob_tag == rob_head && rob[rob_head].valid) {
         ap_uint<32> word_addr = vec_rs.s1.val >> 2;
+        // Solo se mueven los primeros `vl` elementos: un vle32.v deja el
+        // tail del registro sin tocar, y un vse32.v no escribe memoria mas
+        // alla de vl (la spec es explicita en que el store NO debe tocar
+        // memoria fuera del body).
         if (vec_rs.is_load) {
             for (int lane = 0; lane < OOO_VEC_LANES; lane++) {
 #pragma HLS UNROLL
-                vregs[vec_rs.vd_or_vs3.to_uint() * OOO_VEC_LANES + lane] =
-                    dmem[(word_addr + lane) & (OOO_DMEM_WORDS - 1)];
+                if (lane < vec_rs.vl.to_uint())
+                    vregs[vec_rs.vd_or_vs3.to_uint() * OOO_VEC_LANES + lane] =
+                        dmem[(word_addr + lane) & (OOO_DMEM_WORDS - 1)];
             }
         } else {
             for (int lane = 0; lane < OOO_VEC_LANES; lane++) {
 #pragma HLS UNROLL
-                dmem[(word_addr + lane) & (OOO_DMEM_WORDS - 1)] =
-                    vregs[vec_rs.vd_or_vs3.to_uint() * OOO_VEC_LANES + lane];
+                if (lane < vec_rs.vl.to_uint())
+                    dmem[(word_addr + lane) & (OOO_DMEM_WORDS - 1)] =
+                        vregs[vec_rs.vd_or_vs3.to_uint() * OOO_VEC_LANES + lane];
             }
         }
         rob[vec_rs.rob_tag].ready = true;
@@ -911,6 +950,7 @@ void rv32_ooo_tick(
                     vec_rs.is_arith = false;
                     vec_rs.vd_or_vs3 = rd; // mismo campo de bits que vd (load) o vs3 (store)
                     vec_rs.rob_tag = new_tag;
+                    vec_rs.vl = csr_vl;    // largo vectorial vigente en este punto del programa
                     vec_rs.s1 = read_operand(rs1); // direccion base, banco entero
                     RobEntry& e = rob[new_tag];
                     e.valid = true; e.is_store = false; e.dest_is_fp = false;
@@ -1016,6 +1056,80 @@ void rv32_ooo_tick(
                     // la unidad de branch resuelva el destino real
                     fetch_stalled = true;
                 }
+            } else if (opc == rvv::OPCODE_OP_V && f3 == rvv::FUNCT3_OPCFG) {
+                // ---- vsetvli / vsetivli / vsetvl (seccion 5 de la spec) ----
+                //   vsetvli  : instr[31]=0      , vtypei=instr[30:20], AVL=x[rs1]
+                //   vsetivli : instr[31:30]=11  , vtypei=instr[29:20], AVL=uimm(rs1)
+                //   vsetvl   : instr[31:25]=1000000, vtype=x[rs2]    , AVL=x[rs1]
+                //
+                // Se resuelve EN EL DISPATCH (como LUI/AUIPC/JAL): el
+                // dispatch es en orden y este core no especula, asi que
+                // actualizar vtype/vl aca es preciso -- y ademas garantiza
+                // que toda instruccion vectorial despachada despues capture
+                // el vl nuevo, sin serializar la unidad VEC.
+                bool is_vsetivli = (((iw >> 30) & 0x3) == 0x3);
+                bool is_vsetvl   = (((iw >> 25) & 0x7F) == 0b1000000);
+
+                // Como vsetvl* se resuelve en el dispatch, necesita el
+                // valor de x[rs1] (el AVL) YA disponible. Si el productor
+                // sigue en vuelo, se detiene el dispatch y se reintenta el
+                // ciclo siguiente -- un stall en orden, correcto y simple
+                // (vset* es de por si semi-serializante en implementaciones
+                // reales, y ocurre una vez por bucle, no en el camino
+                // critico del rendimiento).
+                Operand avl_op  = read_operand(rs1);
+                Operand vtyp_op = read_operand(rs2);
+                bool operands_ready = is_vsetivli
+                                    ? true
+                                    : (avl_op.ready && (!is_vsetvl || vtyp_op.ready));
+
+                if (!operands_ready) {
+                    can_dispatch = false; // stall: el AVL todavia no existe
+                } else {
+                can_dispatch = true;
+
+                uint32_t vtype_req;
+                uint32_t avl;
+                bool avl_is_max = false;   // rs1==x0 && rd!=x0 -> vl = VLMAX
+                bool keep_vl    = false;   // rs1==x0 && rd==x0 -> conserva vl
+                if (is_vsetivli) {
+                    vtype_req = (iw >> 20) & 0x3FF;   // zimm[9:0]
+                    avl = rs1.to_uint();              // uimm[4:0], sin caso especial
+                } else if (is_vsetvl) {
+                    vtype_req = vtyp_op.val.to_uint(); // x[rs2]
+                    if (rs1 == 0) { if (rd == 0) keep_vl = true; else avl_is_max = true; }
+                    avl = avl_op.val.to_uint();
+                } else { // vsetvli
+                    vtype_req = (iw >> 20) & 0x7FF;   // zimm[10:0]
+                    if (rs1 == 0) { if (rd == 0) keep_vl = true; else avl_is_max = true; }
+                    avl = avl_op.val.to_uint();
+                }
+
+                // Este core solo implementa SEW=32 / LMUL=1. Cualquier otra
+                // configuracion es "no soportada" -> se activa vill y vl=0,
+                // exactamente como manda la spec (seccion 3.4.4).
+                uint32_t vsew  = (vtype_req >> 3) & 0x7;
+                uint32_t vlmul = vtype_req & 0x7;
+                bool supported = (vsew == rvv::VSEW_32) && (vlmul == rvv::VLMUL_1);
+
+                ap_uint<32> new_vl;
+                if (!supported) {
+                    csr_vtype = (ap_uint<32>(1) << rvv::VILL_BIT); // vill, resto en cero
+                    new_vl = 0;
+                } else {
+                    csr_vtype = vtype_req;
+                    if (keep_vl)          new_vl = csr_vl;                 // vtype cambia, vl se conserva
+                    else if (avl_is_max)  new_vl = rvv::VLMAX;
+                    else                  new_vl = (avl < rvv::VLMAX) ? ap_uint<32>(avl)
+                                                                      : ap_uint<32>(rvv::VLMAX);
+                }
+                csr_vl = new_vl;
+
+                // vsetvl* escribe en rd el vl efectivamente concedido
+                RobEntry& e = rob[new_tag];
+                e.valid = true; e.is_store = false; e.dest_is_fp = false;
+                e.dest = rd; e.value = new_vl; e.ready = true;
+                } // fin de operands_ready
             } else if (opc == rvv::OPCODE_OP_V) {
                 // vadd.vv/vsub.vv/vmul.vv -- funct6/funct3 verificados
                 // contra la seccion 19 de la especificacion oficial RVV
@@ -1033,6 +1147,7 @@ void rv32_ooo_tick(
                         vec_rs.vs1 = rs1; vec_rs.vs2 = rs2; // mismos bits que rs1/rs2
                         vec_rs.arith_op = is_add ? ap_uint<2>(0) : is_sub ? ap_uint<2>(1) : ap_uint<2>(2);
                         vec_rs.rob_tag = new_tag;
+                        vec_rs.vl = csr_vl;       // largo vectorial vigente al despachar
                         vec_rs.executing = false; // arranca en la etapa 3, como el resto de las unidades
                         RobEntry& e = rob[new_tag];
                         e.valid = true; e.is_store = false; e.dest_is_fp = false;

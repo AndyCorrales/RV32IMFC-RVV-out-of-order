@@ -57,6 +57,11 @@ constexpr uint32_t MCAUSE  = 0x342;
 constexpr uint32_t MTVAL   = 0x343;
 constexpr uint32_t MIP     = 0x344;
 constexpr uint32_t MHARTID = 0xF14;
+// CSRs vectoriales (RVV): de solo lectura desde csrr -- los escribe la
+// familia vsetvli/vsetivli/vsetvl, no csrw.
+constexpr uint32_t VL      = 0xC20;
+constexpr uint32_t VTYPE   = 0xC21;
+constexpr uint32_t VLENB   = 0xC22;
 } // namespace CSR
 
 // funct3 para OP y OP_IMM (comparten codificacion base: la ALU hace lo

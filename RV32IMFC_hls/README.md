@@ -386,8 +386,8 @@ v1.0), no se inventó de memoria.
   elemento sobre los 4 lanes de dos registros vectoriales.
 
 **Simplificaciones deliberadas** (ver `LIMITACIONES.md`): `SEW=32` y
-`LMUL=1` fijos (`VLEN=128` → exactamente 4 elementos por registro, sin
-`vtype`/`vsetvli` dinámico), sin máscara (`vm=1` siempre, `v0` no se usa
+`LMUL=1` son la única configuración aceptada (`VLEN=128` → VLMAX=4
+elementos); cualquier otra activa `vill`. Sin máscara (`vm=1` siempre, `v0` no se usa
 como registro de máscara), sin loads/stores segmentados ni
 strided/indexed, sin reducción/permutación, sin punto flotante
 vectorial. El operando escalar `rs1` (dirección base) entra ya resuelto
