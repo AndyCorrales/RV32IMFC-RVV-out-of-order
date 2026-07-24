@@ -13,6 +13,11 @@ RV32IMFC_hls/*.log
 RV32IMFC_hls/vivado/reports/
 *.jou
 .Xil/
+third_party/
+*.elf
+RV32IMFC_hls/rv32_ooo_tb
+RV32IMFC_hls/ooo_demo_tb
+RV32IMFC_hls/rv32_core_tb
 
 # Artefactos de compilacion del binario bare-metal (se regeneran con build.sh)
 RV32IMFC_hls/baremetal/*.o
