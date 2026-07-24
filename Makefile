@@ -54,6 +54,7 @@ HLS_STD  := -std=c++14 -O2
         coremark coremark-fast coremark-valid coremark-noc run-coremark \
         axpy gemm run-axpy run-gemm ooo-tb demo-tb core-tb \
         rvv-ooo-tb run-rvv-ooo check-rvv-ooo sim-rvv run-rvv-tlm check-rvv-tlm \
+        axpy-ooo run-axpy-ooo check-axpy-ooo \
         run-ooo run-demo run-core
 
 all: sim coremark ooo-tb
@@ -192,13 +193,28 @@ check-rvv-tlm: sim-rvv
 	      echo "PASS: OoO+RVV TLM." ; } || \
 	    { tail -25 /tmp/rvv_tlm.log ; echo "FAIL: OoO+RVV TLM." ; exit 1 ; }
 
+# ===== Experimento V-3/V-4: AXPY escalar vs vectorial en el OoO =====
+axpy-ooo: $(AP_TYPES)
+	$(CXX) $(HLS_STD) -I $(RVVHLS) $(AP_INC) -o $(RVVHLS)/axpy_ooo_tb \
+	    $(RVVHLS)/axpy_ooo_tb.cpp $(RVVHLS)/rv32_ooo.cpp
+
+run-axpy-ooo: axpy-ooo
+	$(RVVHLS)/axpy_ooo_tb
+
+check-axpy-ooo: axpy-ooo
+	@echo "=== [HLS] AXPY escalar vs vectorial sobre el OoO (V-3/V-4) ==="
+	@$(RVVHLS)/axpy_ooo_tb > /tmp/axpy_ooo.log 2>&1 && \
+	    { grep -E "IPC|speedup|reduccion|escalar |vectorial " /tmp/axpy_ooo.log ; \
+	      echo "PASS: AXPY OoO." ; } || \
+	    { tail -20 /tmp/axpy_ooo.log ; echo "FAIL: AXPY OoO." ; exit 1 ; }
+
 # =================== TODO junto ===========================
-check: check-coremark check-hls check-rvv-ooo check-rvv-tlm
+check: check-coremark check-hls check-rvv-ooo check-rvv-tlm check-axpy-ooo
 	@echo ""
 	@echo "TODAS las pruebas de reproducibilidad pasaron (TLM + HLS)."
 
 clean:
 	rm -f $(SIM) $(TLM)/*.elf $(HLS)/rv32_ooo_tb $(HLS)/ooo_demo_tb \
-	      $(HLS)/rv32_core_tb $(RVVHLS)/rvv_ooo_tb $(RVVTLM)/riscv_rvv_sim \
+	      $(HLS)/rv32_core_tb $(RVVHLS)/rvv_ooo_tb $(RVVHLS)/axpy_ooo_tb $(RVVTLM)/riscv_rvv_sim \
 	      /tmp/cm_check.log /tmp/ooo_tb.log /tmp/demo_tb.log /tmp/core_tb.log \
 	      /tmp/rvv_ooo.log /tmp/rvv_tlm.log
