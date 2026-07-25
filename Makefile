@@ -20,6 +20,8 @@ TLM    := RV32IMFC_tlm
 HLS    := RV32IMFC_hls
 RVVHLS := RV32IMFC+RVV+OOO-HLS
 RVVTLM := RV32IMFC+RVV+OOO-TLM
+SOCHLS := RISCV-SoC
+SOCTLM := RISCV-SoC-TLM
 
 # --- Toolchains ---
 CC   := riscv64-unknown-elf-gcc
@@ -55,6 +57,7 @@ HLS_STD  := -std=c++14 -O2
         axpy gemm run-axpy run-gemm ooo-tb demo-tb core-tb \
         rvv-ooo-tb run-rvv-ooo check-rvv-ooo sim-rvv run-rvv-tlm check-rvv-tlm \
         axpy-ooo run-axpy-ooo check-axpy-ooo \
+        soc-tb soc-axpy check-soc sim-soc-tlm check-soc-tlm check-axpy-parity \
         run-ooo run-demo run-core
 
 all: sim coremark ooo-tb
@@ -209,7 +212,55 @@ check-axpy-ooo: axpy-ooo
 	    { tail -20 /tmp/axpy_ooo.log ; echo "FAIL: AXPY OoO." ; exit 1 ; }
 
 # =================== TODO junto ===========================
-check: check-coremark check-hls check-rvv-ooo check-rvv-tlm check-axpy-ooo
+# ===================== RISC-V SoC (TAGE + VIQ + arbitro) =====================
+# Las carpetas RISCV-SoC/ (HLS) y RISCV-SoC-TLM/ (SystemC) implementan el
+# diagrama del SoC sobre la base RVV+OoO. Mismos testbenches (8 suites) y
+# el MISMO experimento AXPY V-3/V-4: bajo memoria arbitrada realista el
+# speedup vectorial es 1.66x (vs 2.66x del core estable) -- ambos numeros
+# se citan juntos en el articulo.
+soc-tb: $(AP_TYPES)
+	$(CXX) $(HLS_STD) -I $(SOCHLS) $(AP_INC) -o $(SOCHLS)/soc_tb \
+	    $(SOCHLS)/soc_tb.cpp $(SOCHLS)/soc_top.cpp
+
+soc-axpy: $(AP_TYPES)
+	$(CXX) $(HLS_STD) -I $(SOCHLS) $(AP_INC) -o $(SOCHLS)/axpy_soc_tb \
+	    $(SOCHLS)/axpy_soc_tb.cpp $(SOCHLS)/soc_top.cpp
+
+check-soc: soc-tb soc-axpy
+	@echo "=== [SoC HLS] 8 suites (ISA+RVV+TAGE+bare-metal) + AXPY ==="
+	@$(SOCHLS)/soc_tb > /tmp/soc_tb.log 2>&1 && \
+	    { grep -E "Todos los checks|acierto" /tmp/soc_tb.log ; } || \
+	    { tail -20 /tmp/soc_tb.log ; echo "FAIL: SoC HLS." ; exit 1 ; }
+	@$(SOCHLS)/axpy_soc_tb > /tmp/axpy_soc.log 2>&1 && \
+	    { grep -E "IPC|speedup|escalar |vectorial " /tmp/axpy_soc.log ; \
+	      echo "PASS: SoC HLS." ; } || \
+	    { tail -20 /tmp/axpy_soc.log ; echo "FAIL: AXPY SoC." ; exit 1 ; }
+
+sim-soc-tlm:
+	$(CXX) -std=c++17 -O2 -I $(SOCTLM)/src -o $(SOCTLM)/riscv_soc_sim \
+	    $(SOCTLM)/src/main.cpp -lsystemc -lpthread
+	$(CXX) -std=c++17 -O2 -I $(SOCTLM)/src -o $(SOCTLM)/axpy_soc_tlm \
+	    $(SOCTLM)/src/axpy_soc_tlm.cpp -lsystemc -lpthread
+
+check-soc-tlm: sim-soc-tlm
+	@echo "=== [SoC TLM] 8 suites + AXPY (paridad con HLS) ==="
+	@$(SOCTLM)/riscv_soc_sim > /tmp/soc_tlm.log 2>&1 && \
+	    { grep -E "Todos los checks|acierto" /tmp/soc_tlm.log ; } || \
+	    { tail -20 /tmp/soc_tlm.log ; echo "FAIL: SoC TLM." ; exit 1 ; }
+	@$(SOCTLM)/axpy_soc_tlm > /tmp/axpy_soc_tlm.log 2>&1 && \
+	    { grep -E "IPC|speedup" /tmp/axpy_soc_tlm.log ; echo "PASS: SoC TLM." ; } || \
+	    { tail -20 /tmp/axpy_soc_tlm.log ; echo "FAIL: AXPY SoC TLM." ; exit 1 ; }
+
+# La PARIDAD ciclo a ciclo entre pistas, como regresion ejecutable: los
+# ciclos del AXPY (escalar y vectorial) deben ser IDENTICOS en HLS y TLM.
+check-axpy-parity: soc-axpy sim-soc-tlm
+	@echo "=== [SoC] paridad de ciclos HLS vs TLM (AXPY) ==="
+	@$(SOCHLS)/axpy_soc_tb  | grep -E "^escalar|^vectorial" > /tmp/par_h.txt
+	@$(SOCTLM)/axpy_soc_tlm | grep -E "^escalar|^vectorial" > /tmp/par_t.txt
+	@diff /tmp/par_h.txt /tmp/par_t.txt && echo "PASS: paridad exacta." || \
+	    { echo "FAIL: las pistas divergieron." ; exit 1 ; }
+
+check: check-coremark check-hls check-rvv-ooo check-rvv-tlm check-axpy-ooo check-soc check-soc-tlm check-axpy-parity
 	@echo ""
 	@echo "TODAS las pruebas de reproducibilidad pasaron (TLM + HLS)."
 

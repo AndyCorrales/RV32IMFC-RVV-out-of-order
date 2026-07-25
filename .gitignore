@@ -31,3 +31,40 @@ RV32IMFC+RVV+OOO-HLS/baremetal/*.elf
 RV32IMFC+RVV+OOO-TLM/riscv_ooo_sim
 RV32IMFC+RVV+OOO-HLS/baremetal/*.o
 RV32IMFC+RVV+OOO-HLS/baremetal/*.elf
+# Binarios de la C-simulacion (g++) de la pista RVV: los reconstruye
+# 'make check-rvv-ooo' / 'make check-axpy-ooo'. No tienen extension.
+RV32IMFC+RVV+OOO-HLS/rvv_ooo_tb
+RV32IMFC+RVV+OOO-HLS/axpy_ooo_tb
+RV32IMFC+RVV+OOO-TLM/riscv_rvv_sim
+
+# ============================================================
+#  SoC: RISCV-SoC/ (HLS) y RISCV-SoC-TLM/ (SystemC/TLM)
+# ============================================================
+# Estas carpetas implementan el diagrama del SoC (TAGE + coprocesador
+# vectorial con VIQ + interconnect con arbitro). Lo que se versiona es el
+# CODIGO (*.cpp, *.h), la documentacion (*.md) y los scripts (*.tcl); todo
+# lo de abajo es GENERADO y se reconstruye con 'make check-soc' /
+# 'make check-soc-tlm' / run_hls.tcl -- no va a git.
+
+# --- HLS ---
+# Proyecto de Vitis HLS (~190 MB): RTL generado, logs de sintesis y las
+# bases de datos internas de la herramienta. Lo regenera run_hls.tcl.
+RISCV-SoC/*_proj/
+RISCV-SoC/*.log
+# Binarios de la C-simulacion con g++ (no tienen extension -> uno a uno):
+#   soc_tb        -> las 8 suites de verificacion
+#   axpy_soc_tb   -> el experimento AXPY escalar vs vectorial (V-3/V-4)
+RISCV-SoC/soc_tb
+RISCV-SoC/axpy_soc_tb
+# Objetos y ELF del bare-metal (se regeneran con baremetal/build.sh).
+RISCV-SoC/baremetal/*.o
+RISCV-SoC/baremetal/*.elf
+
+# --- TLM ---
+# Simuladores SystemC compilados ('make check-soc-tlm'):
+#   riscv_soc_sim  -> las 8 suites
+#   axpy_soc_tlm   -> el AXPY, para el check de paridad de ciclos con HLS
+RISCV-SoC-TLM/riscv_soc_sim
+RISCV-SoC-TLM/axpy_soc_tlm
+RISCV-SoC-TLM/src/riscv_soc_sim
+RISCV-SoC-TLM/src/axpy_soc_tlm
